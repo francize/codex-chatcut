@@ -1,3 +1,11 @@
 {
-  "mcpServers": {}
+  "mcpServers": {
+    "codex_chatcut": {
+      "title": "Codex ChatCut",
+      "description": "Render and control a project-backed native video editor without a second chat.",
+      "command": "node",
+      "args": ["./mcp/server.mjs"],
+      "cwd": "."
+    }
+  }
 }

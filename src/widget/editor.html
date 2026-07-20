@@ -1,0 +1,204 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="dark light" />
+    <title>ChatCut Editor</title>
+    <style>
+      :root {
+        color-scheme: dark;
+        font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        --bg: #111214;
+        --panel: #191b1f;
+        --panel-raised: #202329;
+        --line: #30343c;
+        --muted: #8c939f;
+        --text: #f3f4f6;
+        --accent: #f36b3d;
+        --accent-soft: rgb(243 107 61 / 18%);
+      }
+
+      * { box-sizing: border-box; }
+      html, body { width: 100%; min-height: 100%; margin: 0; background: var(--bg); color: var(--text); }
+      button { font: inherit; }
+
+      .app {
+        min-height: 100vh;
+        display: grid;
+        grid-template-rows: 48px minmax(300px, 1fr) minmax(170px, 34vh);
+        overflow: hidden;
+      }
+
+      .toolbar {
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        padding: 0 16px;
+        border-bottom: 1px solid var(--line);
+        background: #15171a;
+      }
+
+      .mark {
+        width: 24px;
+        height: 24px;
+        border-radius: 7px;
+        display: grid;
+        place-items: center;
+        background: var(--accent);
+        color: white;
+        font-weight: 800;
+      }
+
+      .title { font-size: 14px; font-weight: 700; letter-spacing: .01em; }
+      .status { margin-left: auto; color: var(--muted); font-size: 12px; }
+
+      .workspace {
+        display: grid;
+        grid-template-columns: minmax(180px, 22%) minmax(320px, 1fr) minmax(200px, 24%);
+        min-height: 0;
+      }
+
+      .region { min-width: 0; min-height: 0; background: var(--panel); }
+      .region + .region { border-left: 1px solid var(--line); }
+      .region-title {
+        height: 38px;
+        display: flex;
+        align-items: center;
+        padding: 0 12px;
+        border-bottom: 1px solid var(--line);
+        color: #d8dbe1;
+        font-size: 12px;
+        font-weight: 650;
+        text-transform: uppercase;
+        letter-spacing: .08em;
+      }
+
+      .empty {
+        height: calc(100% - 38px);
+        display: grid;
+        place-items: center;
+        padding: 24px;
+        text-align: center;
+        color: var(--muted);
+        font-size: 13px;
+        line-height: 1.55;
+      }
+
+      .preview-shell {
+        height: calc(100% - 38px);
+        padding: 20px;
+        display: grid;
+        place-items: center;
+        background: radial-gradient(circle at center, #2a2e36 0, #141518 65%);
+      }
+
+      .preview-frame {
+        width: min(100%, 720px);
+        aspect-ratio: 16 / 9;
+        border: 1px solid #3a3f49;
+        border-radius: 8px;
+        display: grid;
+        place-items: center;
+        background: #08090a;
+        color: #656c78;
+        box-shadow: 0 20px 55px rgb(0 0 0 / 30%);
+      }
+
+      .timeline {
+        border-top: 1px solid var(--line);
+        background: #15171a;
+        min-height: 0;
+      }
+
+      .timeline-head {
+        height: 38px;
+        display: flex;
+        align-items: center;
+        gap: 16px;
+        padding: 0 14px;
+        border-bottom: 1px solid var(--line);
+        font-size: 12px;
+      }
+
+      .timecode { margin-left: auto; font-variant-numeric: tabular-nums; color: var(--muted); }
+      .tracks { padding: 12px 14px; display: grid; gap: 8px; }
+      .track { display: grid; grid-template-columns: 42px 1fr; gap: 10px; align-items: center; }
+      .track-label { color: var(--muted); font-size: 11px; }
+      .track-lane { height: 42px; border-radius: 6px; border: 1px dashed #353a43; background: #181a1e; }
+
+      .badge {
+        padding: 4px 8px;
+        border-radius: 999px;
+        background: var(--accent-soft);
+        color: #ffb197;
+        font-size: 11px;
+      }
+
+      @media (max-width: 760px) {
+        .workspace { grid-template-columns: 1fr; grid-template-rows: 120px minmax(260px, 1fr) 140px; }
+        .region + .region { border-left: 0; border-top: 1px solid var(--line); }
+        .app { grid-template-rows: 48px minmax(520px, 1fr) 180px; overflow: auto; }
+      }
+    </style>
+  </head>
+  <body>
+    <main class="app" aria-label="ChatCut Editor">
+      <header class="toolbar">
+        <span class="mark" aria-hidden="true">C</span>
+        <span class="title">ChatCut Editor</span>
+        <span class="badge">Codex is the agent</span>
+        <span class="status" id="host-status">Native Widget · empty project</span>
+      </header>
+
+      <section class="workspace" aria-label="Editor workspace">
+        <aside class="region" data-chatcut-region="media-library" aria-label="Media library">
+          <div class="region-title">Media</div>
+          <div class="empty">Project media will appear here after it is registered through the project-bound session.</div>
+        </aside>
+
+        <section class="region" data-chatcut-region="preview" aria-label="Preview">
+          <div class="region-title">Preview</div>
+          <div class="preview-shell">
+            <div class="preview-frame">16:9 project preview</div>
+          </div>
+        </section>
+
+        <aside class="region" data-chatcut-region="inspector" aria-label="Inspector">
+          <div class="region-title">Inspector</div>
+          <div class="empty">Select a timeline item to inspect its timing and properties.</div>
+        </aside>
+      </section>
+
+      <section class="timeline" data-chatcut-region="timeline" aria-label="Timeline">
+        <div class="timeline-head">
+          <strong>Timeline</strong>
+          <span class="badge">Revision 0</span>
+          <span class="timecode">00:00:00:00</span>
+        </div>
+        <div class="tracks">
+          <div class="track"><span class="track-label">V1</span><div class="track-lane"></div></div>
+          <div class="track"><span class="track-label">A1</span><div class="track-lane"></div></div>
+        </div>
+      </section>
+    </main>
+
+    <script>
+      (() => {
+        "use strict";
+        const status = document.getElementById("host-status");
+        function applyHostGlobals(globals) {
+          const mode = globals && (globals.displayMode || globals.hostContext && globals.hostContext.displayMode);
+          if (status && mode) status.textContent = `Native Widget · ${mode}`;
+          document.documentElement.dataset.displayMode = mode || "unknown";
+        }
+        window.addEventListener("openai:set_globals", (event) => applyHostGlobals(event.detail && event.detail.globals));
+        window.addEventListener("message", (event) => {
+          const context = event.data && event.data.params && event.data.params.context;
+          if (event.data && event.data.method === "ui/notifications/host-context-changed") applyHostGlobals({ hostContext: context });
+        });
+        applyHostGlobals(window.openai || {});
+      })();
+    </script>
+  </body>
+</html>
