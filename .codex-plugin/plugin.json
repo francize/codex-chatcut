@@ -1,0 +1,39 @@
+{
+  "name": "codex-chatcut",
+  "version": "0.1.0",
+  "description": "A native Codex video-editing widget with project-bound MCP tools and no second chat.",
+  "author": {
+    "name": "francize",
+    "url": "https://github.com/francize"
+  },
+  "homepage": "https://github.com/francize/codex-chatcut",
+  "repository": "https://github.com/francize/codex-chatcut",
+  "license": "MIT",
+  "keywords": [
+    "video-editing",
+    "native-widget",
+    "mcp",
+    "codex"
+  ],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Codex ChatCut",
+    "shortDescription": "Edit project video from the current Codex task.",
+    "longDescription": "Codex ChatCut adds a project-backed native video editor to Codex while Codex remains the sole conversational agent.",
+    "developerName": "francize",
+    "category": "Productivity",
+    "capabilities": [
+      "Native editor widget",
+      "Versioned timeline proposals",
+      "Project-local media preview"
+    ],
+    "websiteURL": "https://github.com/francize/codex-chatcut",
+    "brandColor": "#F36B3D",
+    "defaultPrompt": [
+      "Open ChatCut for this project.",
+      "Edit the selected ChatCut timeline items.",
+      "Undo the last ChatCut commit."
+    ]
+  },
+  "mcpServers": "./.mcp.json"
+}
