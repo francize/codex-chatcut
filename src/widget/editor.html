@@ -127,6 +127,26 @@
       .track-label { color: var(--muted); font-size: 11px; }
       .track-lane { height: 42px; border-radius: 6px; border: 1px dashed #353a43; background: #181a1e; }
 
+      .track-lane.has-items { position: relative; border-style: solid; overflow: hidden; }
+      .timeline-item {
+        position: absolute;
+        top: 4px;
+        bottom: 4px;
+        min-width: 48px;
+        border: 1px solid #d85b31;
+        border-radius: 4px;
+        background: #6c321f;
+        color: #ffe9e1;
+        padding: 0 8px;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+        cursor: pointer;
+        text-align: left;
+        font-size: 11px;
+      }
+      .timeline-item[aria-pressed="true"] { outline: 2px solid #ffb197; outline-offset: -2px; background: #8d3c22; }
+
       .badge {
         padding: 4px 8px;
         border-radius: 999px;
@@ -143,7 +163,7 @@
     </style>
   </head>
   <body>
-    <main class="app" aria-label="ChatCut Editor">
+    <main class="app" aria-label="ChatCut Editor" data-chatcut-bridge="mcp-app">
       <header class="toolbar">
         <span class="mark" aria-hidden="true">C</span>
         <span class="title">ChatCut Editor</span>
@@ -154,51 +174,36 @@
       <section class="workspace" aria-label="Editor workspace">
         <aside class="region" data-chatcut-region="media-library" aria-label="Media library">
           <div class="region-title">Media</div>
-          <div class="empty">Project media will appear here after it is registered through the project-bound session.</div>
+          <div class="empty" id="media-content">Project media will appear here after it is registered through the project-bound session.</div>
         </aside>
 
         <section class="region" data-chatcut-region="preview" aria-label="Preview">
           <div class="region-title">Preview</div>
           <div class="preview-shell">
-            <div class="preview-frame">16:9 project preview</div>
+            <div class="preview-frame" id="preview-content">16:9 project preview</div>
           </div>
         </section>
 
         <aside class="region" data-chatcut-region="inspector" aria-label="Inspector">
           <div class="region-title">Inspector</div>
-          <div class="empty">Select a timeline item to inspect its timing and properties.</div>
+          <div class="empty" id="inspector-content">Select a timeline item to inspect its timing and properties.</div>
         </aside>
       </section>
 
       <section class="timeline" data-chatcut-region="timeline" aria-label="Timeline">
         <div class="timeline-head">
           <strong>Timeline</strong>
-          <span class="badge">Revision 0</span>
-          <span class="timecode">00:00:00:00</span>
+          <span class="badge" id="revision-badge">Revision 0</span>
+          <span class="timecode" id="timecode">00:00:00:00</span>
         </div>
-        <div class="tracks">
+        <div class="tracks" id="tracks">
           <div class="track"><span class="track-label">V1</span><div class="track-lane"></div></div>
-          <div class="track"><span class="track-label">A1</span><div class="track-lane"></div></div>
         </div>
       </section>
     </main>
 
     <script>
-      (() => {
-        "use strict";
-        const status = document.getElementById("host-status");
-        function applyHostGlobals(globals) {
-          const mode = globals && (globals.displayMode || globals.hostContext && globals.hostContext.displayMode);
-          if (status && mode) status.textContent = `Native Widget · ${mode}`;
-          document.documentElement.dataset.displayMode = mode || "unknown";
-        }
-        window.addEventListener("openai:set_globals", (event) => applyHostGlobals(event.detail && event.detail.globals));
-        window.addEventListener("message", (event) => {
-          const context = event.data && event.data.params && event.data.params.context;
-          if (event.data && event.data.method === "ui/notifications/host-context-changed") applyHostGlobals({ hostContext: context });
-        });
-        applyHostGlobals(window.openai || {});
-      })();
+      /* __CHATCUT_WIDGET_JS__ */
     </script>
   </body>
 </html>

@@ -46,8 +46,12 @@ export async function probeNativeWidget() {
     assert.match(html, /data-chatcut-region="preview"/);
     assert.match(html, /data-chatcut-region="inspector"/);
     assert.match(html, /data-chatcut-region="timeline"/);
+    assert.match(html, /data-chatcut-bridge="mcp-app"/);
+    assert.match(html, /save_chatcut_selection/);
     assert.match(html, /ChatCut Editor/);
-    assert.doesNotMatch(html, /ChatPanel|chat history|api[-_ ]?key|Anthropic|messages\.stream/i);
+    const shellMarkup = html.replace(/<script\b[\s\S]*?<\/script>/gi, "");
+    assert.doesNotMatch(shellMarkup, /ChatPanel|chat history|api[-_ ]?key|Anthropic/i);
+    assert.doesNotMatch(html, /messages\.stream/i);
     assert.doesNotMatch(html, /<script\b[^>]+src=|<link\b[^>]+href=/i);
 
     const csp = /** @type {{connect_domains?: string[], resource_domains?: string[]}} */ (
