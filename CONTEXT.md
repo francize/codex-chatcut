@@ -1,26 +1,27 @@
 # Codex ChatCut domain context
 
-Codex ChatCut embeds a project-backed video-editing surface in Codex while Codex remains the sole conversational agent.
+Codex ChatCut hosts the real OpenChatCut editor inside Codex while Codex remains the sole conversational agent. It is an integration layer, not a second video editor implementation.
 
 ## Glossary
 
-- **Codex task**: the host conversation containing user instructions, model reasoning, tool calls, approvals, and responses.
-- **Editor Widget**: the native MCP App rendered by Codex. It shows media, preview, inspector, and timeline UI, but no conversation history.
-- **Editor Session**: the authoritative project-bound service that owns timeline state, revision checks, proposals, commits, and undo.
-- **Project Root**: the canonical workspace directory fixed when an Editor Session opens. It cannot be changed by later model tool arguments.
-- **Project Document**: the serializable editing state stored below the Project Root. Media bytes are referenced by opaque Asset IDs.
-- **Revision**: the monotonic Project Document version used for compare-and-swap mutation.
-- **Selection Context**: the current timeline, selected Item IDs, playhead, range, and Revision exposed to Codex.
-- **Timeline Patch**: a validated list of editing operations targeted at one expected Revision.
-- **Proposal**: a non-destructive preview of a Timeline Patch, including its base Revision and resulting Project Document summary.
-- **Commit**: an atomically applied Proposal that advances Revision and can be undone.
-- **Media Gateway**: the tokenized loopback HTTP data plane that serves registered assets by opaque Asset ID with byte-range support.
-- **Control Plane**: the stdio MCP tools used by Codex and the Editor Widget. It never exposes an unauthenticated HTTP MCP endpoint.
-- **Intent**: a one-shot request sent by the Editor Widget into the existing Codex task; it is not a second chat system.
+- **Codex task**: the only conversation containing instructions, approvals, tool calls, and responses.
+- **OpenChatCut upstream**: the pinned `0xsline/OpenChatCut` source revision used for EditorCore, ProjectDoc, timeline UI, persistence, media, preview, export, and editor tools.
+- **Host Patch**: a small, reviewable patch applied to the pinned upstream source. It adds Codex host mode, security hooks, and external-agent integration without replacing editor semantics.
+- **Codex Host Mode**: an OpenChatCut route in which `ChatPanel`, its divider, provider settings, and AI-seed actions are not mounted. Library, Preview, Inspector, Timeline, and the external-agent bridge remain mounted.
+- **Sidecar**: the windowless OpenChatCut loopback server launched and stopped by the plugin's stdio MCP process.
+- **Editor Surface**: the upstream OpenChatCut web editor opened in Codex's built-in Browser. It is not an MCP Widget iframe.
+- **ProjectDoc**: OpenChatCut's authoritative native project model. This repository must not define a parallel project or timeline model.
+- **EditorCommands**: OpenChatCut's native command interface backed by its reducer and undo history.
+- **External Agent Bridge**: OpenChatCut's browser-to-server bridge that registers and executes real editor tools against the mounted ProjectDoc.
+- **Proposal**: an edit preview built with OpenChatCut's existing `makeDraft`, `buildProposal`, and action types.
+- **Commit**: application of an accepted Proposal with OpenChatCut's `replayActions`/`applyDoc`, producing one native undo step.
+- **stdio Proxy**: the plugin MCP server that owns sidecar lifecycle and forwards MCP calls to the authenticated OpenChatCut HTTP MCP endpoint.
+- **Browser Capability**: a short-lived, sidecar-issued credential used only by the same-origin Editor Surface for bridge registration, polling, and results.
 
 ## Non-goals for the MVP
 
-- Full OpenChatCut feature parity or source-code import.
-- Production FFmpeg/Remotion export.
-- A standalone desktop application.
-- Cross-platform packaging beyond the Codex plugin bundle.
+- Reimplementing OpenChatCut types, reducers, timeline, media server, preview, export, or persistence.
+- Mounting or merely collapsing OpenChatCut's ChatPanel in Codex Host Mode.
+- A standalone Electron window or a second model/provider runtime.
+- Loading the loopback editor in an MCP App iframe while the production Codex host rejects localhost frame origins.
+- Shipping OpenChatCut assets or Remotion-dependent binaries before their redistribution terms are audited.

@@ -1,31 +1,31 @@
 {
   "name": "codex-chatcut",
   "version": "0.1.0",
-  "description": "A native Codex video-editing widget with project-bound MCP tools and no second chat.",
+  "description": "Run the real OpenChatCut editor inside Codex with no second chat.",
   "author": {
     "name": "francize",
     "url": "https://github.com/francize"
   },
   "homepage": "https://github.com/francize/codex-chatcut",
   "repository": "https://github.com/francize/codex-chatcut",
-  "license": "MIT",
+  "license": "AGPL-3.0-or-later",
   "keywords": [
     "video-editing",
-    "native-widget",
+    "openchatcut",
     "mcp",
     "codex"
   ],
   "skills": "./skills/",
   "interface": {
     "displayName": "Codex ChatCut",
-    "shortDescription": "Edit project video from the current Codex task.",
-    "longDescription": "Codex ChatCut adds a project-backed native video editor to Codex while Codex remains the sole conversational agent.",
+    "shortDescription": "Use the real OpenChatCut editor from your Codex task.",
+    "longDescription": "Codex ChatCut launches a windowless OpenChatCut sidecar, opens its editor-only mode inside Codex, and proxies its native editor tools while Codex remains the sole conversational agent.",
     "developerName": "francize",
     "category": "Productivity",
     "capabilities": [
-      "Native editor widget",
-      "Versioned timeline proposals",
-      "Project-local media preview"
+      "OpenChatCut editor in Codex",
+      "Native OpenChatCut tools and proposals",
+      "Project-local preview and export"
     ],
     "websiteURL": "https://github.com/francize/codex-chatcut",
     "brandColor": "#F36B3D",

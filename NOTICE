@@ -1,0 +1,17 @@
+Codex ChatCut
+
+This distribution integrates and modifies portions of OpenChatCut.
+
+Upstream: https://github.com/0xsline/OpenChatCut
+Upstream snapshot: 850c238b894c2b0138ffc7944e8c7e2c30156fcd
+Upstream license: GNU Affero General Public License v3.0 or later
+
+Downstream modifications:
+- Added a Codex stdio MCP and sidecar lifecycle integration.
+- Added an editor-only Codex host mode.
+- Removed the embedded conversational ChatPanel and model-provider surfaces in that mode.
+- Restricted local server, bridge, navigation, and permission boundaries.
+- Connected Codex tasks to OpenChatCut's native project, tool, proposal, and undo paths.
+
+OpenChatCut and ChatCut names and marks belong to their respective owners.
+No affiliation or endorsement is implied.

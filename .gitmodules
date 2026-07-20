@@ -1,0 +1,3 @@
+[submodule "vendor/openchatcut"]
+	path = vendor/openchatcut
+	url = https://github.com/0xsline/OpenChatCut.git
