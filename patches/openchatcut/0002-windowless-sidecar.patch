@@ -1,0 +1,128 @@
+diff --git a/desktop/codex-sidecar.ts b/desktop/codex-sidecar.ts
+new file mode 100644
+index 0000000..4051927
+--- /dev/null
++++ b/desktop/codex-sidecar.ts
+@@ -0,0 +1,122 @@
++import { mkdir, realpath, stat } from 'node:fs/promises';
++import { isAbsolute, relative } from 'node:path';
++import type { Server } from 'node:http';
++
++interface ReadyRecord {
++  type: 'openchatcut-ready';
++  origin: string;
++}
++
++interface ErrorRecord {
++  type: 'openchatcut-error';
++  message: string;
++}
++
++let server: Server | null = null;
++let stopping = false;
++
++function requiredEnv(name: string): string {
++  const value = process.env[name]?.trim();
++  if (!value) throw new Error(`${name} is required`);
++  if (!isAbsolute(value)) throw new Error(`${name} must be an absolute path`);
++  return value;
++}
++
++function isInside(parent: string, child: string): boolean {
++  const pathToChild = relative(parent, child);
++  return pathToChild === '' || (!pathToChild.startsWith('..') && !isAbsolute(pathToChild));
++}
++
++async function directory(path: string, label: string): Promise<string> {
++  const canonical = await realpath(path);
++  if (!(await stat(canonical)).isDirectory()) throw new Error(`${label} must be a directory`);
++  return canonical;
++}
++
++async function configureWorkspace(): Promise<{ dataRoot: string; distDir: string }> {
++  const workspaceRoot = await directory(
++    requiredEnv('CODEX_CHATCUT_WORKSPACE_ROOT'),
++    'CODEX_CHATCUT_WORKSPACE_ROOT',
++  );
++  const requestedDataRoot = requiredEnv('OPENCHATCUT_DATA_ROOT');
++  await mkdir(requestedDataRoot, { recursive: true, mode: 0o700 });
++  const dataRoot = await directory(requestedDataRoot, 'OPENCHATCUT_DATA_ROOT');
++  if (!isInside(workspaceRoot, dataRoot)) {
++    throw new Error('OPENCHATCUT_DATA_ROOT must stay inside CODEX_CHATCUT_WORKSPACE_ROOT');
++  }
++  const distDir = await directory(requiredEnv('OPENCHATCUT_DIST_DIR'), 'OPENCHATCUT_DIST_DIR');
++
++  // These upstream paths are captured at module evaluation time. Configure the
++  // isolated child before dynamically importing embedded-server and its plugins.
++  process.env.OPENCHATCUT_DATA_ROOT = dataRoot;
++  process.env.HOME = dataRoot;
++  process.env.USERPROFILE = dataRoot;
++  process.chdir(dataRoot);
++
++  return { dataRoot, distDir };
++}
++
++function report(record: ReadyRecord | ErrorRecord): void {
++  if (typeof process.send === 'function') {
++    process.send(record);
++    return;
++  }
++  // The stdio MCP parent owns stdout. A direct-launch fallback is one bounded
++  // JSON record on stderr so supervisors can still parse readiness or failure.
++  process.stderr.write(`${JSON.stringify(record)}\n`);
++}
++
++function diagnostic(error: unknown): string {
++  const value = error instanceof Error ? error.stack ?? error.message : String(error);
++  return value.replace(/[\r\n]+/g, ' ').slice(0, 2_048);
++}
++
++async function closeServer(target: Server): Promise<void> {
++  await new Promise<void>((resolveClose, rejectClose) => {
++    const force = setTimeout(() => target.closeAllConnections(), 1_500);
++    force.unref();
++    target.close((error) => {
++      clearTimeout(force);
++      if (error) rejectClose(error);
++      else resolveClose();
++    });
++    target.closeIdleConnections();
++  });
++}
++
++async function shutdown(exitCode = 0): Promise<void> {
++  if (stopping) return;
++  stopping = true;
++  const target = server;
++  server = null;
++  if (target) {
++    try {
++      await closeServer(target);
++    } catch (error) {
++      report({ type: 'openchatcut-error', message: diagnostic(error) });
++      exitCode = 1;
++    }
++  }
++  process.exit(exitCode);
++}
++
++process.once('SIGTERM', () => void shutdown());
++process.once('SIGINT', () => void shutdown());
++process.once('disconnect', () => void shutdown());
++
++async function boot(): Promise<void> {
++  const { distDir } = await configureWorkspace();
++  const { startEmbeddedServer } = await import('./embedded-server.ts');
++  const embedded = await startEmbeddedServer(distDir);
++  server = embedded.server;
++  if (stopping) {
++    await closeServer(embedded.server);
++    return;
++  }
++  report({ type: 'openchatcut-ready', origin: embedded.origin });
++}
++
++void boot().catch((error) => {
++  report({ type: 'openchatcut-error', message: diagnostic(error) });
++  process.exitCode = 1;
++});

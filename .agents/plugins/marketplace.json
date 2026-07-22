@@ -1,0 +1,20 @@
+{
+  "name": "codex-chatcut",
+  "interface": {
+    "displayName": "Codex ChatCut"
+  },
+  "plugins": [
+    {
+      "name": "codex-chatcut",
+      "source": {
+        "source": "local",
+        "path": "./.local-plugin/current"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Productivity"
+    }
+  ]
+}

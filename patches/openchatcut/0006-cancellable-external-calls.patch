@@ -1,0 +1,432 @@
+diff --git a/server/external-agent/broker.check.ts b/server/external-agent/broker.check.ts
+index e70af36..65f1f4d 100644
+--- a/server/external-agent/broker.check.ts
++++ b/server/external-agent/broker.check.ts
+@@ -1,5 +1,9 @@
+ import assert from 'node:assert/strict';
++import { createServer } from 'node:http';
++import { Client } from '@modelcontextprotocol/sdk/client/index.js';
++import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
+ import {
++  claimEditorCall,
+   connectedProjectIds,
+   isProjectConnected,
+   invokeEditorTool,
+@@ -8,6 +12,7 @@ import {
+   resolveProjectId,
+   settleEditorCall,
+ } from './broker.ts';
++import { handleMcpRequest } from './mcp.ts';
+ 
+ const projectId = 'project-check';
+ const editorId = 'editor-check';
+@@ -21,8 +26,90 @@ assert.equal(resolveProjectId(undefined), projectId);
+ const resultPromise = invokeEditorTool(projectId, 'read_timeline', {});
+ const call = await nextEditorCall(projectId, editorId, new AbortController().signal);
+ assert.equal(call?.name, 'read_timeline');
++assert.equal(claimEditorCall(call!.id), true);
+ assert.equal(isProjectConnected(projectId, Date.now() + 60_000), true, 'in-flight calls keep a busy editor connected');
+ assert.equal(settleEditorCall(call!.id, true, { fps: 30 }), true);
+ assert.equal(isProjectConnected(projectId, Date.now() + 60_000), false, 'settled calls no longer mask an offline editor');
+ assert.deepEqual(await resultPromise, { fps: 30 });
++
++const queuedController = new AbortController();
++const queuedOutcome = invokeEditorTool(
++  projectId,
++  'read_timeline',
++  {},
++  { signal: queuedController.signal },
++).then(
++  () => null,
++  (error: unknown) => error,
++);
++queuedController.abort(new Error('queued request cancelled'));
++assert.match(String(await queuedOutcome), /queued request cancelled/);
++assert.equal(
++  await nextEditorCall(projectId, editorId, AbortSignal.timeout(10)),
++  null,
++  'a cancelled queued call must never be dispatched',
++);
++
++const dispatchedController = new AbortController();
++const dispatchedOutcome = invokeEditorTool(
++  projectId,
++  'read_timeline',
++  {},
++  { signal: dispatchedController.signal },
++).then(
++  () => null,
++  (error: unknown) => error,
++);
++const dispatched = await nextEditorCall(projectId, editorId, new AbortController().signal);
++assert.ok(dispatched);
++dispatchedController.abort(new Error('dispatched request cancelled'));
++assert.match(String(await dispatchedOutcome), /dispatched request cancelled/);
++assert.equal(claimEditorCall(dispatched.id), false, 'the editor must not execute a cancelled call');
++assert.equal(settleEditorCall(dispatched.id, true, { ignored: true }), false, 'late results are ignored');
++
++const mcpProjectId = 'mcp-cancellation-project';
++const mcpEditorId = 'mcp-cancellation-editor';
++registerEditor(mcpProjectId, mcpEditorId, [{
++  name: 'read_timeline',
++  input_schema: { type: 'object', properties: {} },
++}]);
++let origin = '';
++const httpServer = createServer((request, response) => {
++  void handleMcpRequest(request, response, origin).catch((error) => {
++    if (!response.headersSent) response.writeHead(500).end(String(error));
++  });
++});
++await new Promise<void>((resolveListen, rejectListen) => {
++  httpServer.once('error', rejectListen);
++  httpServer.listen(0, '127.0.0.1', () => resolveListen());
++});
++const address = httpServer.address();
++if (!address || typeof address === 'string') throw new Error('MCP cancellation check did not bind');
++origin = `http://127.0.0.1:${address.port}`;
++
++const client = new Client({ name: 'openchatcut-cancellation-check', version: '1.0.0' });
++try {
++  await client.connect(new StreamableHTTPClientTransport(new URL('/mcp', origin)));
++  const mcpController = new AbortController();
++  const mcpOutcome = client.callTool(
++    { name: 'read_timeline', arguments: { editorProjectId: mcpProjectId } },
++    undefined,
++    { signal: mcpController.signal, timeout: 2_000 },
++  ).then(
++    () => null,
++    (error: unknown) => error,
++  );
++  const mcpCall = await nextEditorCall(mcpProjectId, mcpEditorId, AbortSignal.timeout(1_000));
++  assert.ok(mcpCall);
++  mcpController.abort(new Error('MCP caller cancelled'));
++  assert.ok(await mcpOutcome instanceof Error);
++  await new Promise((resolveWait) => setTimeout(resolveWait, 100));
++  assert.equal(claimEditorCall(mcpCall.id), false, 'MCP cancellation must reach the broker signal');
++  assert.equal(settleEditorCall(mcpCall.id, true, { ignored: true }), false);
++} finally {
++  await client.close();
++  await new Promise<void>((resolveClose, rejectClose) => {
++    httpServer.close((error) => (error ? rejectClose(error) : resolveClose()));
++  });
++}
+ console.log('external-agent broker check passed');
+diff --git a/server/external-agent/broker.ts b/server/external-agent/broker.ts
+index 6d17ac0..2a4c9a8 100644
+--- a/server/external-agent/broker.ts
++++ b/server/external-agent/broker.ts
+@@ -23,9 +23,16 @@ interface QueuedCall {
+   name: string;
+   arguments: Record<string, unknown>;
+   dispatched: boolean;
++  claimed: boolean;
+   resolve: (value: unknown) => void;
+   reject: (error: Error) => void;
+   timer: ReturnType<typeof setTimeout>;
++  removeAbortListener: () => void;
++}
++
++export interface InvokeEditorToolOptions {
++  signal?: AbortSignal;
++  timeoutMs?: number;
+ }
+ 
+ export interface ExternalEditorCall {
+@@ -114,11 +121,14 @@ export function invokeEditorTool(
+   projectId: string,
+   name: string,
+   args: Record<string, unknown>,
+-  timeoutMs = DEFAULT_TIMEOUT_MS,
++  options: InvokeEditorToolOptions = {},
+ ): Promise<unknown> {
+   if (!connectedProjectIds().includes(projectId)) {
+     throw new Error(`Project ${projectId} is not open in a connected OpenChatCut editor.`);
+   }
++  if (options.signal?.aborted) {
++    return Promise.reject(cancellationError(options.signal.reason));
++  }
+   return new Promise((resolve, reject) => {
+     const call: QueuedCall = {
+       id: randomUUID(),
+@@ -126,13 +136,17 @@ export function invokeEditorTool(
+       name,
+       arguments: args,
+       dispatched: false,
++      claimed: false,
+       resolve,
+       reject,
+       timer: setTimeout(() => {
+-        pending.delete(call.id);
+-        reject(new Error(`OpenChatCut tool ${name} timed out`));
+-      }, Math.min(MAX_TIMEOUT_MS, Math.max(1_000, timeoutMs))),
++        cancelEditorCall(call, new Error(`OpenChatCut tool ${name} timed out`));
++      }, Math.min(MAX_TIMEOUT_MS, Math.max(1_000, options.timeoutMs ?? DEFAULT_TIMEOUT_MS))),
++      removeAbortListener: () => {},
+     };
++    const onAbort = () => cancelEditorCall(call, cancellationError(options.signal?.reason));
++    options.signal?.addEventListener('abort', onAbort, { once: true });
++    call.removeAbortListener = () => options.signal?.removeEventListener('abort', onAbort);
+     const queue = queues.get(projectId) ?? [];
+     queue.push(call);
+     queues.set(projectId, queue);
+@@ -141,13 +155,52 @@ export function invokeEditorTool(
+   });
+ }
+ 
++function cancellationError(reason: unknown): Error {
++  if (reason instanceof Error) return reason;
++  const error = new Error(typeof reason === 'string' ? reason : 'OpenChatCut tool call cancelled');
++  error.name = 'AbortError';
++  return error;
++}
++
++function removeQueuedCall(call: QueuedCall): void {
++  const queue = queues.get(call.projectId);
++  if (!queue) return;
++  const index = queue.indexOf(call);
++  if (index >= 0) queue.splice(index, 1);
++  if (!queue.length) queues.delete(call.projectId);
++}
++
++function forgetCall(call: QueuedCall): boolean {
++  if (!pending.delete(call.id)) return false;
++  clearTimeout(call.timer);
++  call.removeAbortListener();
++  removeQueuedCall(call);
++  return true;
++}
++
++function cancelEditorCall(call: QueuedCall, error: Error): void {
++  if (!forgetCall(call)) return;
++  call.reject(error);
++}
++
+ export async function nextEditorCall(
+   projectId: string,
+   editorId: string,
+   signal: AbortSignal,
+ ): Promise<ExternalEditorCall | null> {
+   if (!touchEditor(projectId, editorId)) return null;
+-  const take = () => queues.get(projectId)?.shift();
++  const take = () => {
++    const queue = queues.get(projectId);
++    while (queue?.length) {
++      const candidate = queue.shift()!;
++      if (pending.has(candidate.id)) {
++        if (!queue.length) queues.delete(projectId);
++        return candidate;
++      }
++    }
++    queues.delete(projectId);
++    return undefined;
++  };
+   let call = take();
+   if (!call) {
+     await new Promise<void>((resolve) => {
+@@ -169,15 +222,28 @@ export async function nextEditorCall(
+   return { id: call.id, name: call.name, arguments: call.arguments };
+ }
+ 
++/**
++ * Atomically move a dispatched call across the editor execution boundary.
++ * A call cancelled before this point must never be executed by the browser.
++ * Cancellation after a successful claim is necessarily best-effort because
++ * upstream editor tools do not accept an AbortSignal; its late result is still
++ * discarded. Codex structural mutations execute against the native proposal
++ * draft, so claiming does not itself apply them to the live ProjectDoc.
++ */
++export function claimEditorCall(id: string): boolean {
++  const call = pending.get(id);
++  if (!call || !call.dispatched || call.claimed) return false;
++  call.claimed = true;
++  return true;
++}
++
+ export function settleEditorCall(
+   id: string,
+   ok: boolean,
+   value: unknown,
+ ): boolean {
+   const call = pending.get(id);
+-  if (!call) return false;
+-  pending.delete(id);
+-  clearTimeout(call.timer);
++  if (!call || !call.claimed || !forgetCall(call)) return false;
+   if (ok) call.resolve(value);
+   else call.reject(new Error(typeof value === 'string' ? value : JSON.stringify(value)));
+   return true;
+diff --git a/server/external-agent/mcp.ts b/server/external-agent/mcp.ts
+--- a/server/external-agent/mcp.ts
++++ b/server/external-agent/mcp.ts
+@@ -1,3 +1,4 @@
++import { randomUUID } from 'node:crypto';
+ import type { IncomingMessage, ServerResponse } from 'node:http';
+ import { Server } from '@modelcontextprotocol/sdk/server/index.js';
+ import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
+@@ -123,7 +124,12 @@ async function callControlTool(
+   return undefined;
+ }
+ 
+-async function callTool(name: string, rawArgs: unknown, baseUrl: string): Promise<unknown> {
++async function callTool(
++  name: string,
++  rawArgs: unknown,
++  baseUrl: string,
++  signal: AbortSignal,
++): Promise<unknown> {
+   const args = rawArgs && typeof rawArgs === 'object'
+     ? { ...(rawArgs as Record<string, unknown>) }
+     : {};
+@@ -135,7 +141,7 @@ async function callTool(name: string, rawArgs: unknown, baseUrl: string): Promis
+     const requested = Number(args.timeoutSeconds);
+     args.timeoutSeconds = Math.min(45, requested > 0 ? requested : 45);
+   }
+-  return invokeEditorTool(projectId, name, args);
++  return invokeEditorTool(projectId, name, args, { signal });
+ }
+ 
+ function makeServer(baseUrl: string): Server {
+@@ -144,9 +150,14 @@ function makeServer(baseUrl: string): Server {
+     { capabilities: { tools: {} } },
+   );
+   server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: mcpTools() }));
+-  server.setRequestHandler(CallToolRequestSchema, async (request) => {
++  server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
+     try {
+-      const result = await callTool(request.params.name, request.params.arguments, baseUrl);
++      const result = await callTool(
++        request.params.name,
++        request.params.arguments,
++        baseUrl,
++        extra.signal,
++      );
+       return {
+         content: toMcpContent(result),
+         structuredContent: toStructuredContent(result),
+@@ -208,17 +219,51 @@ export function toMcpContent(result: unknown): CallToolResult['content'] {
+   ];
+ }
+ 
++interface McpEndpoint {
++  baseUrl: string;
++  server: Server;
++  transport: StreamableHTTPServerTransport;
++}
++
++let activeEndpoint: McpEndpoint | null = null;
++let endpointStarting: Promise<McpEndpoint> | null = null;
++
++async function createEndpoint(baseUrl: string): Promise<McpEndpoint> {
++  const server = makeServer(baseUrl);
++  const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: randomUUID });
++  const endpoint = { baseUrl, server, transport };
++  transport.onclose = () => {
++    if (activeEndpoint?.transport === transport) activeEndpoint = null;
++  };
++  await server.connect(transport);
++  return endpoint;
++}
++
++async function mcpEndpoint(baseUrl: string): Promise<McpEndpoint> {
++  if (activeEndpoint) {
++    if (activeEndpoint.baseUrl !== baseUrl) {
++      throw new Error('OpenChatCut MCP endpoint origin changed during the sidecar process');
++    }
++    return activeEndpoint;
++  }
++  endpointStarting ??= createEndpoint(baseUrl).then((endpoint) => {
++    activeEndpoint = endpoint;
++    return endpoint;
++  }).finally(() => {
++    endpointStarting = null;
++  });
++  const endpoint = await endpointStarting;
++  if (endpoint.baseUrl !== baseUrl) {
++    throw new Error('OpenChatCut MCP endpoint origin changed during startup');
++  }
++  return endpoint;
++}
++
+ export async function handleMcpRequest(
+   req: IncomingMessage,
+   res: ServerResponse,
+   baseUrl: string,
+ ): Promise<void> {
+-  const server = makeServer(baseUrl);
+-  const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
+-  res.on('close', () => {
+-    void transport.close();
+-    void server.close();
+-  });
+-  await server.connect(transport);
++  const { transport } = await mcpEndpoint(baseUrl);
+   await transport.handleRequest(req, res);
+ }
+diff --git a/server/plugins/external-agent.ts b/server/plugins/external-agent.ts
+--- a/server/plugins/external-agent.ts
++++ b/server/plugins/external-agent.ts
+@@ -1,6 +1,7 @@
+ import type { IncomingMessage, ServerResponse } from 'node:http';
+ import type { Plugin } from 'vite';
+ import {
++  claimEditorCall,
+   nextEditorCall,
+   registerEditor,
+   settleEditorCall,
+@@ -127,6 +128,13 @@ async function handleBridge(
+     sendJson(res, settleEditorCall(body.id, body.ok, body.value) ? 200 : 404, { ok: true });
+     return;
+   }
++  if (req.method === 'POST' && url.pathname === '/claim') {
++    const body = await readJson(req);
++    if (typeof body.id !== 'string') throw new Error('invalid tool claim');
++    const claimed = claimEditorCall(body.id);
++    sendJson(res, claimed ? 200 : 409, { ok: claimed });
++    return;
++  }
+   if (req.method === 'GET' && url.pathname === '/tools') {
+     sendJson(res, 200, { tools: mcpTools() });
+     return;
+diff --git a/src/agent/useExternalAgentBridge.ts b/src/agent/useExternalAgentBridge.ts
+--- a/src/agent/useExternalAgentBridge.ts
++++ b/src/agent/useExternalAgentBridge.ts
+@@ -30,16 +30,30 @@ async function bootstrapBrowserCapability(signal: AbortSignal): Promise<void> {
+   if (!response.ok) throw new Error(`bridge bootstrap failed: HTTP ${response.status}`);
+ }
+ 
+-async function sendResult(id: string, ok: boolean, value: unknown): Promise<void> {
++async function sendResult(id: string, ok: boolean, value: unknown): Promise<boolean> {
+   const response = await fetch('/api/external-agent/result', {
+     method: 'POST',
+     credentials: 'same-origin',
+     headers: { 'Content-Type': 'application/json' },
+     body: JSON.stringify({ id, ok, value }),
+   });
++  if (response.status === 404) return false;
+   if (!response.ok) throw new Error(`result delivery failed: HTTP ${response.status}`);
++  return true;
+ }
+ 
++async function claimCall(id: string): Promise<boolean> {
++  const response = await fetch('/api/external-agent/claim', {
++    method: 'POST',
++    credentials: 'same-origin',
++    headers: { 'Content-Type': 'application/json' },
++    body: JSON.stringify({ id }),
++  });
++  if (response.status === 409) return false;
++  if (!response.ok) throw new Error(`tool claim failed: HTTP ${response.status}`);
++  return true;
++}
++
+ async function executeExternalCall(
+   call: ExternalCall,
+   ctx: AgentContext,
+@@ -48,6 +60,7 @@ async function executeExternalCall(
+   codexHost: boolean,
+ ): Promise<void> {
+   try {
++    if (!await claimCall(call.id)) return;
+     const result = await executeExternalTool({
+       name: call.name,
+       args: call.arguments,

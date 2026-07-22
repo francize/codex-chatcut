@@ -1,0 +1,974 @@
+diff --git a/src/Editor.tsx b/src/Editor.tsx
+index bb6147b..d8f73e1 100644
+--- a/src/Editor.tsx
++++ b/src/Editor.tsx
+@@ -35,6 +35,8 @@ import { ShortcutsDialog } from './shortcuts/ShortcutsDialog';
+ import { AppToastHost } from './ui/AppToastHost';
+ import { showAppToast } from './ui/appToast';
+ import { useExternalAgentBridge } from './agent/useExternalAgentBridge';
++import { createProposalController } from './agent/proposalControllerRuntime';
++import { ProposalCard } from './components/chat/ProposalCard';
+ import { isolateVoiceOnSrc, strengthFromAudioFxId } from './audio/isolateVoice';
+ import { analyzeClipLoudness, gainForTarget } from './audio/loudness';
+ 
+@@ -119,10 +121,17 @@ export default function Editor({ initial, project, onHome, onRename }: EditorPro
+     }),
+     [commands, project.id, onRename, changeCreativeMode],
+   );
+-  useExternalAgentBridge(agentCtx, project.id);
+-
++  const agentCtxRef = useRef(agentCtx);
++  agentCtxRef.current = agentCtx;
++  const proposalController = useMemo(
++    () => createProposalController(project.id, () => agentCtxRef.current),
++    [project.id],
++  );
++  useEffect(() => { void proposalController.hydrate(); }, [proposalController]);
+   // a pending proposal's draft result, previewed in the player (null = committed)
+   const [previewState, setPreviewState] = useState<TimelineState | null>(null);
++  const externalBridge = useExternalAgentBridge(agentCtx, project.id, proposalController, isCodexHost);
++  const refreshExternalProposalStale = externalBridge.refreshStale;
+   // library「用 AI 生成」→ prefill the chat composer (nonce forces re-seed of the same text)
+   const [chatSeed, setChatSeed] = useState<{ text: string; nonce: number; reference?: AgentReference } | null>(null);
+   // 设计风格(品牌)编辑器弹窗。
+@@ -143,6 +152,10 @@ export default function Editor({ initial, project, onHome, onRename }: EditorPro
+     const id = setTimeout(() => saveProject(project.id, doc), 500);
+     return () => clearTimeout(id);
+   }, [doc, project.id]);
++  useEffect(() => refreshExternalProposalStale(), [doc, refreshExternalProposalStale]);
++  useEffect(() => {
++    if (!externalBridge.proposal) setPreviewState(null);
++  }, [externalBridge.proposal]);
+ 
+   // Rehydrate missing /media/uploads files from IDB blob cache (disk wipe / new clone).
+   // Also resume any open generation jobs so refresh mid-generate still lands assets.
+@@ -373,7 +386,7 @@ export default function Editor({ initial, project, onHome, onRename }: EditorPro
+ 
+       {!isCodexHost && (
+         <Suspense fallback={null}>
+-          <ChatPanel ctx={agentCtx} projectId={project.id} collapsed={chatCollapsed} onToggleCollapse={() => setChatCollapsed((v) => !v)} onPreviewState={setPreviewState} seed={chatSeed} creativeMode={creativeMode} onCreativeModeChange={changeCreativeMode} onImportMedia={importToPool} />
++          <ChatPanel ctx={agentCtx} projectId={project.id} proposalController={proposalController} collapsed={chatCollapsed} onToggleCollapse={() => setChatCollapsed((v) => !v)} onPreviewState={setPreviewState} seed={chatSeed} creativeMode={creativeMode} onCreativeModeChange={changeCreativeMode} onImportMedia={importToPool} />
+         </Suspense>
+       )}
+ 
+@@ -426,6 +439,25 @@ export default function Editor({ initial, project, onHome, onRename }: EditorPro
+         <PreviewPanel state={previewState ?? state} playerRef={playerRef} onImport={importToCanvas}
+           onUpdateCaptions={previewState ? undefined : commands.updateCaptions}
+           onSeedChat={isCodexHost ? undefined : (text) => setChatSeed({ text, nonce: Date.now() })} />
++        {isCodexHost && externalBridge.proposal && (
++          <div
++            data-cc-external-proposal-dock
++            aria-label="Codex OpenChatCut proposal"
++            style={{ flex: '0 1 360px', minHeight: 150, overflow: 'auto', padding: 8, borderTop: `1px solid ${theme.border}`, background: theme.panel }}
++          >
++            <ProposalCard
++              proposal={externalBridge.proposal}
++              stale={externalBridge.stale}
++              onApply={(selected) => {
++                void externalBridge.applyProposal(selected).catch((error) => {
++                  showAppToast(error instanceof Error ? error.message : String(error), { error: true });
++                });
++              }}
++              onReject={() => { void externalBridge.rejectProposal(); }}
++              onPreview={(enabled) => setPreviewState(enabled ? externalBridge.proposal?.resultState ?? null : null)}
++            />
++          </div>
++        )}
+         {selectedItem && (
+           <InspectorPanel
+             templates={allTemplates}
+diff --git a/src/agent/externalToolExecutor.ts b/src/agent/externalToolExecutor.ts
+new file mode 100644
+index 0000000..5f80f57
+--- /dev/null
++++ b/src/agent/externalToolExecutor.ts
+@@ -0,0 +1,105 @@
++import type { AgentContext } from './context';
++import type { ProposalController } from './proposalController';
++import type { AgentToolSchema } from './tool-schema';
++import type { ProjectDoc } from '../editor/types';
++
++export const CODEX_PROPOSAL_TOOL_SCHEMAS: AgentToolSchema[] = [
++  {
++    name: 'get_chatcut_context',
++    description: 'Read the mounted OpenChatCut project and pending native edit proposal without changing either.',
++    input_schema: { type: 'object', properties: {} },
++  },
++  {
++    name: 'get_chatcut_proposal',
++    description: 'Read the pending OpenChatCut native proposal, including its original tool ids and reducer actions.',
++    input_schema: { type: 'object', properties: {} },
++  },
++  {
++    name: 'apply_chatcut_proposal',
++    description: 'Apply the pending OpenChatCut proposal atomically as one native undo step. Fails if the project changed.',
++    input_schema: { type: 'object', properties: {} },
++  },
++  {
++    name: 'reject_chatcut_proposal',
++    description: 'Reject the pending OpenChatCut proposal without changing the project.',
++    input_schema: { type: 'object', properties: {} },
++  },
++  {
++    name: 'undo_chatcut_edit',
++    description: 'Undo one edit through the mounted OpenChatCut editor history and persist the restored project.',
++    input_schema: { type: 'object', properties: {} },
++  },
++];
++
++export interface ExternalToolExecutionDependencies {
++  executeTool: (name: string, args: Record<string, unknown>, ctx: AgentContext) => Promise<unknown>;
++  afterCommit: () => Promise<void>;
++  saveProject: (projectId: string, doc: ProjectDoc) => Promise<void>;
++}
++
++interface ExternalToolExecutionOptions {
++  name: string;
++  args: Record<string, unknown>;
++  context: AgentContext;
++  projectId: string;
++  codexHost: boolean;
++  nativeToolNames: ReadonlySet<string>;
++  proposalController: ProposalController;
++  dependencies: ExternalToolExecutionDependencies;
++}
++
++const controlToolNames = new Set(CODEX_PROPOSAL_TOOL_SCHEMAS.map((tool) => tool.name));
++
++/** Select host integration behavior without duplicating any editor operation. */
++export async function executeExternalTool(options: ExternalToolExecutionOptions): Promise<unknown> {
++  const {
++    name,
++    args,
++    context,
++    projectId,
++    codexHost,
++    nativeToolNames,
++    proposalController,
++    dependencies,
++  } = options;
++
++  if (!codexHost) {
++    if (!nativeToolNames.has(name)) throw new Error(`unknown OpenChatCut tool ${name}`);
++    const result = await dependencies.executeTool(name, args, context);
++    await dependencies.afterCommit();
++    await dependencies.saveProject(projectId, context.getDoc());
++    return result;
++  }
++
++  // The React hydration effect is not an ordering boundary for external MCP
++  // calls. Every Codex read or mutation observes the persisted proposal first.
++  await proposalController.hydrate();
++
++  if (name === 'get_chatcut_context') {
++    proposalController.refreshStale();
++    const state = proposalController.getState();
++    return {
++      projectId,
++      projectDoc: context.getDoc(),
++      pendingProposal: state.proposal,
++      proposalStale: state.stale,
++    };
++  }
++  if (name === 'get_chatcut_proposal') {
++    proposalController.refreshStale();
++    return { projectId, ...proposalController.getState() };
++  }
++  if (name === 'apply_chatcut_proposal') {
++    const result = await proposalController.apply();
++    if (result.status === 'stale') {
++      throw new Error('OpenChatCut proposal is stale; reject it and propose against the current project');
++    }
++    return result;
++  }
++  if (name === 'reject_chatcut_proposal') return proposalController.reject();
++  if (name === 'undo_chatcut_edit') return proposalController.undo();
++  if (controlToolNames.has(name) || !nativeToolNames.has(name)) {
++    throw new Error(`unknown OpenChatCut tool ${name}`);
++  }
++  return proposalController.executeNative(name, args);
++}
+diff --git a/src/agent/proposalController.ts b/src/agent/proposalController.ts
+new file mode 100644
+index 0000000..fc03f81
+--- /dev/null
++++ b/src/agent/proposalController.ts
+@@ -0,0 +1,263 @@
++import type { AgentContext } from './context';
++import type { Operation, Proposal } from './proposal';
++import type { AnyAction, DraftEngine } from '../editor/store';
++import type { ProjectDoc, TimelineState } from '../editor/types';
++
++export interface ProposalControllerState {
++  proposal: Proposal | null;
++  stale: boolean;
++  hydrated: boolean;
++}
++
++export interface ProposalControllerDependencies {
++  makeDraft: (base: ProjectDoc) => DraftEngine;
++  executeTool: (name: string, args: Record<string, unknown>, ctx: AgentContext) => Promise<unknown>;
++  buildOperation: (tool: string, args: Record<string, unknown>, actions: AnyAction[]) => Operation;
++  buildProposal: (
++    operations: Operation[],
++    assistantText: string,
++    baseDoc: ProjectDoc,
++    resultState: TimelineState,
++  ) => Proposal;
++  isProposalStale: (proposal: Proposal, currentDoc: ProjectDoc) => boolean;
++  partitionProposalActions: (actions: AnyAction[]) => {
++    persistent: AnyAction[];
++    proposed: AnyAction[];
++  };
++  replayActions: (base: ProjectDoc, actions: AnyAction[]) => ProjectDoc;
++  loadProposal: (projectId: string) => Promise<Proposal | null>;
++  saveProposal: (projectId: string, proposal: Proposal) => Promise<void>;
++  clearProposal: (projectId: string) => Promise<void>;
++  saveProject: (projectId: string, doc: ProjectDoc) => Promise<void>;
++  afterCommit: () => Promise<void>;
++}
++
++interface ProposalControllerOptions {
++  projectId: string;
++  getContext: () => AgentContext;
++  dependencies: ProposalControllerDependencies;
++}
++
++export interface ProposalDraftResult {
++  proposal: Proposal | null;
++  invalidated: boolean;
++  operationCount: number;
++}
++
++export interface ProposalDraftRun {
++  context: AgentContext;
++  recordTool: (name: string, args: Record<string, unknown>) => void;
++  finish: (assistantText: string, options?: { publish?: boolean }) => Promise<ProposalDraftResult>;
++}
++
++export type ProposalApplyResult =
++  | { status: 'applied'; projectId: string; operations: number }
++  | { status: 'stale'; projectId: string };
++
++export interface ProposalApplyOptions {
++  force?: boolean;
++  /** Runs after the live atomic apply, before proposal-boundary subscribers persist chat. */
++  onApplied?: (result: Extract<ProposalApplyResult, { status: 'applied' }>) => void;
++}
++
++/**
++ * The single proposal lifecycle shared by OpenChatCut's own ChatPanel agent and
++ * Codex Host Mode. Domain mutations remain owned by the injected upstream
++ * draft, action, reducer, persistence, and EditorCommands primitives.
++ */
++export class ProposalController {
++  private readonly projectId: string;
++  private readonly getContext: () => AgentContext;
++  private readonly dependencies: ProposalControllerDependencies;
++  private readonly listeners = new Set<(state: ProposalControllerState) => void>();
++  private state: ProposalControllerState = { proposal: null, stale: false, hydrated: false };
++  private hydration: Promise<ProposalControllerState> | null = null;
++
++  constructor(options: ProposalControllerOptions) {
++    this.projectId = options.projectId;
++    this.getContext = options.getContext;
++    this.dependencies = options.dependencies;
++  }
++
++  getState(): ProposalControllerState {
++    return this.state;
++  }
++
++  subscribe(listener: (state: ProposalControllerState) => void): () => void {
++    this.listeners.add(listener);
++    listener(this.state);
++    return () => this.listeners.delete(listener);
++  }
++
++  hydrate(): Promise<ProposalControllerState> {
++    this.hydration ??= this.hydrateOnce();
++    return this.hydration;
++  }
++
++  refreshStale(): void {
++    const stale = this.state.proposal
++      ? this.dependencies.isProposalStale(this.state.proposal, this.getContext().getDoc())
++      : false;
++    if (stale === this.state.stale) return;
++    this.setState({ ...this.state, stale });
++  }
++
++  beginDraft(): ProposalDraftRun {
++    if (this.state.proposal) {
++      throw new Error('resolve the pending OpenChatCut proposal before starting another edit');
++    }
++    const baseDoc = this.getContext().getDoc();
++    const draft = this.dependencies.makeDraft(baseDoc);
++    const draftContext: AgentContext = {
++      ...this.getContext(),
++      commands: draft.commands,
++      getState: draft.getState,
++      getDoc: draft.getDoc,
++    };
++    const operations: Operation[] = [];
++    let persistence = Promise.resolve();
++    let proposalBaseDoc = baseDoc;
++    let invalidated = false;
++    let finished = false;
++
++    return {
++      context: draftContext,
++      recordTool: (name, args) => {
++        if (finished) throw new Error('OpenChatCut proposal draft is already finished');
++        const actions = draft.takeActions();
++        const { persistent, proposed } = this.dependencies.partitionProposalActions(actions);
++        const observed = this.getContext().getDoc();
++        if (observed !== baseDoc && observed !== proposalBaseDoc) {
++          invalidated = true;
++          proposalBaseDoc = observed;
++        }
++        if (persistent.length) {
++          proposalBaseDoc = this.dependencies.replayActions(proposalBaseDoc, persistent);
++          this.getContext().commands.applyDoc(proposalBaseDoc);
++          const projectSnapshot = proposalBaseDoc;
++          persistence = persistence.then(() => (
++            this.dependencies.saveProject(this.projectId, projectSnapshot)
++          ));
++        }
++        if (proposed.length) {
++          operations.push(this.dependencies.buildOperation(name, args, proposed));
++        }
++      },
++      finish: async (assistantText, options = {}) => {
++        if (finished) throw new Error('OpenChatCut proposal draft is already finished');
++        finished = true;
++        await persistence;
++        const publish = options.publish ?? true;
++        if (!publish || invalidated || !operations.length) {
++          return { proposal: null, invalidated, operationCount: operations.length };
++        }
++        const proposal = this.dependencies.buildProposal(
++          operations,
++          assistantText,
++          proposalBaseDoc,
++          draft.getState(),
++        );
++        await this.publish(proposal);
++        return { proposal, invalidated: false, operationCount: operations.length };
++      },
++    };
++  }
++
++  async executeNative(name: string, args: Record<string, unknown>): Promise<unknown> {
++    await this.hydrate();
++    const run = this.beginDraft();
++    const result = await this.dependencies.executeTool(name, args, run.context);
++    run.recordTool(name, args);
++    const outcome = await run.finish(`OpenChatCut ${name}`);
++    if (outcome.invalidated) {
++      throw new Error('OpenChatCut project changed while the native tool was running; persistent assets were saved, retry the edit');
++    }
++    if (!outcome.proposal) return result;
++    return {
++      status: 'proposal_pending',
++      projectId: this.projectId,
++      result,
++      proposal: outcome.proposal,
++    };
++  }
++
++  async apply(selected?: ReadonlySet<number>, options: ProposalApplyOptions = {}): Promise<ProposalApplyResult> {
++    await this.hydrate();
++    const proposal = this.state.proposal;
++    if (!proposal) throw new Error('no pending OpenChatCut proposal');
++    const context = this.getContext();
++    const currentDoc = context.getDoc();
++    if (!options.force && this.dependencies.isProposalStale(proposal, currentDoc)) {
++      this.setState({ ...this.state, stale: true });
++      return { status: 'stale', projectId: this.projectId };
++    }
++    const operations = proposal.options[0].operations.filter((_, index) => (
++      selected ? selected.has(index) : true
++    ));
++    if (!operations.length) throw new Error('no OpenChatCut proposal operations selected');
++    const nextDoc = this.dependencies.replayActions(
++      currentDoc,
++      operations.flatMap((operation) => operation.actions),
++    );
++    context.commands.applyDoc(nextDoc);
++    const result = {
++      status: 'applied' as const,
++      projectId: this.projectId,
++      operations: operations.length,
++    };
++    options.onApplied?.(result);
++    this.setState({ proposal: null, stale: false, hydrated: true });
++    await Promise.all([
++      this.dependencies.saveProject(this.projectId, nextDoc),
++      this.dependencies.clearProposal(this.projectId),
++    ]);
++    return result;
++  }
++
++  async reject(): Promise<{ status: 'rejected'; projectId: string }> {
++    await this.hydrate();
++    if (!this.state.proposal) throw new Error('no pending OpenChatCut proposal');
++    this.setState({ proposal: null, stale: false, hydrated: true });
++    await this.dependencies.clearProposal(this.projectId);
++    return { status: 'rejected', projectId: this.projectId };
++  }
++
++  async clear(): Promise<void> {
++    this.setState({ proposal: null, stale: false, hydrated: true });
++    await this.dependencies.clearProposal(this.projectId);
++  }
++
++  async undo(): Promise<{ status: 'undone'; projectId: string }> {
++    this.getContext().commands.undo();
++    await this.dependencies.afterCommit();
++    const restored = this.getContext().getDoc();
++    await this.dependencies.saveProject(this.projectId, restored);
++    this.refreshStale();
++    return { status: 'undone', projectId: this.projectId };
++  }
++
++  private async hydrateOnce(): Promise<ProposalControllerState> {
++    const pending = await this.dependencies.loadProposal(this.projectId);
++    // Any completed in-memory mutation (publish/apply/reject/clear) is newer
++    // than the storage read that was already in flight. In particular, a
++    // late load must never resurrect a proposal cleared during hydration.
++    if (this.state.hydrated) return this.state;
++    if (pending && !this.dependencies.isProposalStale(pending, this.getContext().getDoc())) {
++      this.setState({ proposal: pending, stale: false, hydrated: true });
++    } else {
++      this.setState({ proposal: null, stale: false, hydrated: true });
++      if (pending) await this.dependencies.clearProposal(this.projectId);
++    }
++    return this.state;
++  }
++
++  private async publish(proposal: Proposal): Promise<void> {
++    this.setState({ proposal, stale: false, hydrated: true });
++    await this.dependencies.saveProposal(this.projectId, proposal);
++  }
++
++  private setState(state: ProposalControllerState): void {
++    this.state = state;
++    for (const listener of this.listeners) listener(state);
++  }
++}
+diff --git a/src/agent/proposalControllerRuntime.ts b/src/agent/proposalControllerRuntime.ts
+new file mode 100644
+index 0000000..10bd88e
+--- /dev/null
++++ b/src/agent/proposalControllerRuntime.ts
+@@ -0,0 +1,36 @@
++import type { AgentContext } from './context';
++import { ProposalController } from './proposalController';
++import {
++  buildOperation,
++  buildProposal,
++  isProposalStale,
++  partitionProposalActions,
++} from './proposal';
++import { executeTool } from './tools';
++import { makeDraft, replayActions } from '../editor/store';
++import { saveProject } from '../persist/projectStore';
++import { clearProposal, loadProposal, saveProposal } from '../persist/proposalStore';
++
++const afterCommit = () => new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
++
++const dependencies = {
++  makeDraft,
++  executeTool,
++  buildOperation,
++  buildProposal,
++  isProposalStale,
++  partitionProposalActions,
++  replayActions,
++  loadProposal,
++  saveProposal,
++  clearProposal,
++  saveProject,
++  afterCommit,
++};
++
++export function createProposalController(
++  projectId: string,
++  getContext: () => AgentContext,
++): ProposalController {
++  return new ProposalController({ projectId, getContext, dependencies });
++}
+diff --git a/src/agent/useAgent.ts b/src/agent/useAgent.ts
+index 6408c29..26a7213 100644
+--- a/src/agent/useAgent.ts
++++ b/src/agent/useAgent.ts
+@@ -8,12 +8,10 @@ import {
+   type LlmProvider,
+ } from './client';
+ import { normalizeLlmMessages, prepareMessagesForProvider } from './messages';
+-import { makeDraft, replayActions } from '../editor/store';
+-import { buildOperation, buildProposal, isProposalStale, partitionProposalActions, type Operation, type Proposal } from './proposal';
++import type { ProposalController } from './proposalController';
+ import { isSkillAllowed, rememberSkillAllowed, type GuardDecision } from './skills/skillGuard';
+ import type { GenerationGuardSkill } from './settings/agentSettings';
+ import { loadChat, saveChat, clearChat } from '../persist/projectStore';
+-import { loadProposal, saveProposal, clearProposal } from '../persist/proposalStore';
+ 
+ export interface DisplayMessage {
+   // 'continue' = maxTurns 暂停卡(点「继续」续跑;持久化,刷新后仍可续)
+@@ -37,16 +35,14 @@ export interface LiveTool {
+   partial: string;
+ }
+ 
+-export function useAgent(ctx: AgentContext, projectId: string) {
++export function useAgent(ctx: AgentContext, projectId: string, proposalController: ProposalController) {
+   const [messages, setMessages] = useState<DisplayMessage[]>([]);
+   const [running, setRunning] = useState(false);
+   // true once this project's saved chat has been loaded — consumers that want to act
+   // "only on a genuinely empty chat" (e.g. scenario-preset composer seeding) gate on it
+   const [hydrated, setHydrated] = useState(false);
+-  // pending edit proposal awaiting the user's apply/reject
+-  const [proposal, setProposal] = useState<Proposal | null>(null);
+-  // 提案过期横幅(三选:仍然应用 / 重新提案 / 取消)
+-  const [proposalStale, setProposalStale] = useState(false);
++  const [proposalState, setProposalState] = useState(proposalController.getState());
++  const { proposal, stale: proposalStale } = proposalState;
+   // 前置 skill_guard 待决卡 + 工具参数实时流(皆为临时态)
+   const [pendingGuard, setPendingGuard] = useState<PendingGuard | null>(null);
+   const [liveTool, setLiveTool] = useState<LiveTool | null>(null);
+@@ -59,20 +55,21 @@ export function useAgent(ctx: AgentContext, projectId: string) {
+   // gate persistence until the project's saved chat has been hydrated, so the
+   // empty initial state can't clobber it (chat is persisted ordered per-project)
+   const hydratedRef = useRef(false);
+-  const proposalRef = useRef<Proposal | null>(null);
+-  proposalRef.current = proposal;
+   // in-flight turn's abort controller (aborted by the Stop button)
+   const abortRef = useRef<AbortController | null>(null);
++  const runGateRef = useRef(false);
+ 
+-  // hydrate chat + pending proposal on mount / project switch
++  useEffect(() => proposalController.subscribe(setProposalState), [proposalController]);
++  useEffect(() => { void proposalController.hydrate(); }, [proposalController]);
++
++  // hydrate chat on mount / project switch; the shared proposal controller owns
++  // proposal hydration for both ChatPanel and the Codex external bridge.
+   useEffect(() => {
+     let alive = true;
+     hydratedRef.current = false;
+     setHydrated(false);
+-    setProposal(null);
+-    setProposalStale(false);
+     void (async () => {
+-      const [saved, pending] = await Promise.all([loadChat(projectId), loadProposal(projectId)]);
++      const saved = await loadChat(projectId);
+       if (!alive) return;
+       setMessages(saved ? (saved.messages as DisplayMessage[]) : []);
+       if (saved) {
+@@ -86,21 +82,14 @@ export function useAgent(ctx: AgentContext, projectId: string) {
+         llmRef.current = initialMessages();
+       }
+       llmProviderRef.current = PROVIDER;
+-      // Drop stale proposals (user edited the project after the snapshot, or
+-      // corrupt/partial IDB). Clear disk so we don't re-offer a dead card.
+-      if (pending && !isProposalStale(pending, ctxRef.current.getDoc())) {
+-        setProposal(pending);
+-      } else if (pending) {
+-        void clearProposal(projectId);
+-      }
+       hydratedRef.current = true;
+       setHydrated(true);
+     })();
+     return () => { alive = false; };
+   }, [projectId]);
+ 
+-  // persist on turn / proposal boundaries — never mid-stream (running) so IDB
+-  // isn't hammered per token; `proposal` dep captures apply/reject (they push to llmRef).
++  // Persist chat on turn / proposal boundaries — never mid-stream. Proposal
++  // persistence itself belongs to the shared proposal controller.
+   useEffect(() => {
+     if (!hydratedRef.current || running) return;
+     void saveChat(projectId, {
+@@ -109,14 +98,16 @@ export function useAgent(ctx: AgentContext, projectId: string) {
+       llmFormat: 'ai-sdk-v1',
+       llmProvider: llmProviderRef.current,
+     });
+-    if (proposal) void saveProposal(projectId, proposal);
+-    else void clearProposal(projectId);
+   }, [messages, running, proposal, projectId]);
+ 
+   const send = useCallback(
+     async (text: string, opts?: { askOnly?: boolean; references?: AgentReference[] }) => {
+       const trimmed = text.trim();
+-      if (!trimmed || running || proposalRef.current) return; // resolve a pending proposal first
++      if (!trimmed || running || runGateRef.current) return;
++      runGateRef.current = true;
++      try {
++      await proposalController.hydrate();
++      if (proposalController.getState().proposal) return; // resolve a pending proposal first
+       setMessages((m) => [...m, { role: 'user', text: trimmed }]);
+       const contextEntries = resolveAgentReferences(ctxRef.current, opts?.references ?? []);
+       const content = contextEntries.length
+@@ -132,31 +121,14 @@ export function useAgent(ctx: AgentContext, projectId: string) {
+       }
+       llmRef.current.push({ role: 'user', content });
+       setRunning(true);
+-      // Faithful propose→apply: run the agent's tools against a DRAFT copy of the
+-      // PROJECT (so it sees its own pending edits, incl. timeline switches)
+-      // without touching the real store; capture each mutating tool call as an operation.
+-      const baseDoc = ctxRef.current.getDoc();
+-      const draft = makeDraft(baseDoc);
+-      const draftCtx: AgentContext = {
+-        commands: draft.commands,
+-        getState: draft.getState,
+-        getDoc: draft.getDoc,
+-        getCreativeMode: ctxRef.current.getCreativeMode,
+-        setCreativeMode: ctxRef.current.setCreativeMode,
+-        templates: ctxRef.current.templates,
+-        audio: ctxRef.current.audio,
+-        getProjectId: ctxRef.current.getProjectId,
+-        openProject: ctxRef.current.openProject,
+-        onProjectRenamed: ctxRef.current.onProjectRenamed,
+-      };
+-      const ops: Operation[] = [];
+-      let proposalBaseDoc = baseDoc;
+-      let draftInvalidated = false;
++      // ChatPanel and Codex run the same upstream proposal controller. The
++      // controller owns draft capture, persistent assets, stale checks, and apply.
++      const proposalRun = proposalController.beginDraft();
+       let assistantText = '';
+       const ac = new AbortController();
+       abortRef.current = ac;
+       try {
+-        llmRef.current = await runAgent(llmRef.current, draftCtx, (ev) => {
++        llmRef.current = await runAgent(llmRef.current, proposalRun.context, (ev) => {
+           if (ev.type === 'text-start') {
+             setMessages((m) => {
+               const last = m[m.length - 1];
+@@ -184,18 +156,7 @@ export function useAgent(ctx: AgentContext, projectId: string) {
+           } else if (ev.type === 'tool') {
+             setLiveTool(null);
+             setMessages((m) => [...m, { role: 'tool', text: '', tool: { name: ev.name, args: ev.args, result: ev.result } }]);
+-            const actions = draft.takeActions(); // actions this tool produced (empty for read-only tools)
+-            const { persistent, proposed } = partitionProposalActions(actions);
+-            if (persistent.length) {
+-              const observed = ctxRef.current.getDoc();
+-              if (observed !== baseDoc && observed !== proposalBaseDoc) {
+-                draftInvalidated = true;
+-                proposalBaseDoc = observed;
+-              }
+-              proposalBaseDoc = replayActions(proposalBaseDoc, persistent);
+-              ctxRef.current.commands.applyDoc(proposalBaseDoc);
+-            }
+-            if (proposed.length) ops.push(buildOperation(ev.name, (ev.args ?? {}) as Record<string, unknown>, proposed));
++            proposalRun.recordTool(ev.name, (ev.args ?? {}) as Record<string, unknown>);
+           } else if (ev.type === 'max-turns') {
+             setMessages((m) => [...m, { role: 'continue', text: String(ev.turns) }]);
+           } else {
+@@ -221,12 +182,9 @@ export function useAgent(ctx: AgentContext, projectId: string) {
+           },
+         });
+         llmProviderRef.current = PROVIDER;
+-        if (!ac.signal.aborted && ops.length) {
+-          if (draftInvalidated) setMessages((m) => [...m, { role: 'error', text: '生成期间工程发生了其他修改；素材已保存到媒体池，请重新发送落轨请求。' }]);
+-          else {
+-            setProposalStale(false);
+-            setProposal(buildProposal(ops, assistantText, proposalBaseDoc, draft.getState()));
+-          }
++        const outcome = await proposalRun.finish(assistantText, { publish: !ac.signal.aborted });
++        if (outcome.invalidated) {
++          setMessages((m) => [...m, { role: 'error', text: '生成期间工程发生了其他修改；素材已保存到媒体池，请重新发送落轨请求。' }]);
+         }
+       } finally {
+         abortRef.current = null;
+@@ -234,7 +192,10 @@ export function useAgent(ctx: AgentContext, projectId: string) {
+         setRunning(false);
+       }
++      } finally {
++        runGateRef.current = false;
++      }
+     },
+-    [running, projectId],
++    [running, projectId, proposalController],
+   );
+ 
+   // Stop the in-flight turn (发送按钮在运行中切换为停止)。
+@@ -262,48 +220,42 @@ export function useAgent(ctx: AgentContext, projectId: string) {
+     }
+   }, []);
+ 
+-  // Apply the selected operations atomically (one undo step). A proposal is
+-  // rejected if the project changed after it was generated: replaying index- or
+-  // timeline-sensitive actions onto a different snapshot can silently edit the
+-  // wrong clip. Side effects stay outside React state updaters.
+-  const doApply = useCallback((selected: Set<number>) => {
+-    const p = proposalRef.current;
+-    if (!p) return;
+-    const currentDoc = ctxRef.current.getDoc();
+-    const chosen = p.options[0].operations.filter((_, i) => selected.has(i));
+-    const result = replayActions(currentDoc, chosen.flatMap((o) => o.actions));
+-    ctxRef.current.commands.applyDoc(result);
+-    llmRef.current.push({ role: 'user', content: `（已应用提案：${chosen.length}/${p.options[0].operations.length} 项操作。）` });
+-    setProposalStale(false);
+-    setProposal(null);
+-  }, []);
+-
+   const applyProposal = useCallback((selected: Set<number>) => {
+-    const p = proposalRef.current;
++    const p = proposalController.getState().proposal;
+     if (!p) return;
+-    // 过期不再直接丢弃:挂横幅,等用户选 仍然应用/重新提案/取消。
+-    if (isProposalStale(p, ctxRef.current.getDoc())) {
+-      setProposalStale(true);
+-      return;
+-    }
+-    doApply(selected);
+-  }, [doApply]);
++    void proposalController.apply(selected, {
++      onApplied: (result) => {
++        llmRef.current.push({ role: 'user', content: `（已应用提案：${result.operations}/${p.options[0].operations.length} 项操作。）` });
++      },
++    }).catch((error) => {
++      setMessages((m) => [...m, { role: 'error', text: error instanceof Error ? error.message : String(error) }]);
++    });
++  }, [proposalController]);
+ 
+   // 「仍然应用」:明知快照已变仍重放 —— 索引敏感操作可能落错位,由用户拍板。
+-  const forceApplyProposal = useCallback((selected: Set<number>) => { doApply(selected); }, [doApply]);
++  const forceApplyProposal = useCallback((selected: Set<number>) => {
++    const p = proposalController.getState().proposal;
++    if (!p) return;
++    void proposalController.apply(selected, {
++      force: true,
++      onApplied: (result) => {
++        llmRef.current.push({ role: 'user', content: `（已应用提案：${result.operations}/${p.options[0].operations.length} 项操作。）` });
++      },
++    }).catch((error) => {
++      setMessages((m) => [...m, { role: 'error', text: error instanceof Error ? error.message : String(error) }]);
++    });
++  }, [proposalController]);
+ 
+   // 「重新提案」:丢弃旧卡,请 agent 按当前时间线重推等价修改。
+   const reProposeStale = useCallback(() => {
+-    if (!proposalRef.current) return;
+-    setProposalStale(false);
+-    setProposal(null);
+-    proposalRef.current = null;
+-    void send('（工程在上一提案生成后发生了变化。请基于当前 <editor_state> 重新提出与上一提案等价的修改方案。）');
+-  }, [send]);
++    if (!proposalController.getState().proposal) return;
++    void proposalController.reject().then(() => (
++      send('（工程在上一提案生成后发生了变化。请基于当前 <editor_state> 重新提出与上一提案等价的修改方案。）')
++    ));
++  }, [proposalController, send]);
+ 
+   const rejectProposal = useCallback(() => {
+-    if (!proposalRef.current) return;
+-    setProposalStale(false);
++    if (!proposalController.getState().proposal) return;
+     // skill_guard Deny follow-up: agent must not auto-retry generation.
+     llmRef.current.push({
+       role: 'user',
+@@ -312,8 +263,8 @@ export function useAgent(ctx: AgentContext, projectId: string) {
+         '（用户拒绝了上述提案，未应用任何改动。不要自动重试生成。）',
+       ].join('\n'),
+     });
+-    setProposal(null);
+-  }, []);
++    void proposalController.reject();
++  }, [proposalController]);
+ 
+   // 清空对话: drop the rendered rows + the LLM history +
+   // the persisted copy + any pending proposal, so a fresh conversation starts
+@@ -322,11 +273,10 @@ export function useAgent(ctx: AgentContext, projectId: string) {
+     if (running) return;
+     llmRef.current = initialMessages();
+     llmProviderRef.current = PROVIDER;
+-    setProposal(null);
+     setMessages([]);
+     void clearChat(projectId);
+-    void clearProposal(projectId);
+-  }, [running, projectId]);
++    void proposalController.clear();
++  }, [running, projectId, proposalController]);
+ 
+   return {
+     messages, running, hydrated, send, stop, enhance, clearHistory,
+diff --git a/src/agent/useExternalAgentBridge.ts b/src/agent/useExternalAgentBridge.ts
+index 506e5c8..7c9cc48 100644
+--- a/src/agent/useExternalAgentBridge.ts
++++ b/src/agent/useExternalAgentBridge.ts
+@@ -1,5 +1,10 @@
+-import { useEffect, useRef } from 'react';
++import { useCallback, useEffect, useRef, useState } from 'react';
+ import type { AgentContext } from './context';
++import {
++  CODEX_PROPOSAL_TOOL_SCHEMAS,
++  executeExternalTool,
++} from './externalToolExecutor';
++import type { ProposalController, ProposalControllerState } from './proposalController';
+ import { executeTool, TOOL_SCHEMAS } from './tools';
+ import { saveProject } from '../persist/projectStore';
+ 
+@@ -11,6 +16,8 @@ interface ExternalCall {
+ 
+ const nextPaint = () => new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+ const retryDelay = () => new Promise<void>((resolve) => setTimeout(resolve, 1_000));
++const nativeToolNames = new Set(TOOL_SCHEMAS.map((tool) => tool.name));
++const executionDependencies = { executeTool, afterCommit: nextPaint, saveProject };
+ 
+ async function bootstrapBrowserCapability(signal: AbortSignal): Promise<void> {
+   const response = await fetch('/api/external-agent/bootstrap', {
+@@ -37,27 +44,47 @@ async function executeExternalCall(
+   call: ExternalCall,
+   ctx: AgentContext,
+   projectId: string,
++  proposalController: ProposalController,
++  codexHost: boolean,
+ ): Promise<void> {
+-  if (!TOOL_SCHEMAS.some((tool) => tool.name === call.name)) {
+-    await sendResult(call.id, false, `unknown OpenChatCut tool ${call.name}`);
+-    return;
+-  }
+   try {
+-    const result = await executeTool(call.name, call.arguments, ctx);
+-    await nextPaint();
+-    await saveProject(projectId, ctx.getDoc());
++    const result = await executeExternalTool({
++      name: call.name,
++      args: call.arguments,
++      context: ctx,
++      projectId,
++      proposalController,
++      codexHost,
++      nativeToolNames,
++      dependencies: executionDependencies,
++    });
+     await sendResult(call.id, true, result);
+   } catch (error) {
+     await sendResult(call.id, false, error instanceof Error ? error.message : String(error));
+   }
+ }
+ 
+-export function useExternalAgentBridge(ctx: AgentContext, projectId: string): void {
++export interface ExternalAgentBridgeState extends ProposalControllerState {
++  applyProposal: (selected?: ReadonlySet<number>) => Promise<unknown>;
++  rejectProposal: () => Promise<unknown>;
++  refreshStale: () => void;
++}
++
++export function useExternalAgentBridge(
++  ctx: AgentContext,
++  projectId: string,
++  proposalController: ProposalController,
++  codexHost: boolean,
++): ExternalAgentBridgeState {
+   const ctxRef = useRef(ctx);
+   ctxRef.current = ctx;
++  const [state, setState] = useState<ProposalControllerState>(proposalController.getState());
++
++  useEffect(() => proposalController.subscribe(setState), [proposalController]);
+   useEffect(() => {
+     const controller = new AbortController();
+     const editorId = crypto.randomUUID();
++    const toolSchemas = codexHost ? [...TOOL_SCHEMAS, ...CODEX_PROPOSAL_TOOL_SCHEMAS] : TOOL_SCHEMAS;
+     const run = async () => {
+       while (!controller.signal.aborted) {
+         try {
+@@ -66,7 +93,7 @@ export function useExternalAgentBridge(ctx: AgentContext, projectId: string): vo
+             method: 'POST',
+             credentials: 'same-origin',
+             headers: { 'Content-Type': 'application/json' },
+-            body: JSON.stringify({ projectId, editorId, tools: TOOL_SCHEMAS }),
++            body: JSON.stringify({ projectId, editorId, tools: toolSchemas }),
+             signal: controller.signal,
+           });
+           if (!registered.ok) throw new Error(`registration failed: HTTP ${registered.status}`);
+@@ -81,7 +108,13 @@ export function useExternalAgentBridge(ctx: AgentContext, projectId: string): vo
+             });
+             if (response.status === 204) continue;
+             if (!response.ok) throw new Error(`poll failed: HTTP ${response.status}`);
+-            await executeExternalCall(await response.json() as ExternalCall, ctxRef.current, projectId);
++            await executeExternalCall(
++              await response.json() as ExternalCall,
++              ctxRef.current,
++              projectId,
++              proposalController,
++              codexHost,
++            );
+           }
+         } catch {
+           if (!controller.signal.aborted) await retryDelay();
+@@ -90,5 +123,14 @@ export function useExternalAgentBridge(ctx: AgentContext, projectId: string): vo
+     };
+     void run();
+     return () => controller.abort();
+-  }, [projectId]);
++  }, [codexHost, projectId, proposalController]);
++
++  const applyProposal = useCallback(async (selected?: ReadonlySet<number>) => {
++    const result = await proposalController.apply(selected);
++    if (result.status === 'stale') throw new Error('OpenChatCut proposal is stale');
++    return result;
++  }, [proposalController]);
++  const rejectProposal = useCallback(() => proposalController.reject(), [proposalController]);
++  const refreshStale = useCallback(() => proposalController.refreshStale(), [proposalController]);
++  return { ...state, applyProposal, rejectProposal, refreshStale };
+ }
+diff --git a/src/components/chat/ChatPanel.tsx b/src/components/chat/ChatPanel.tsx
+index b48f9a4..cdd461e 100644
+--- a/src/components/chat/ChatPanel.tsx
++++ b/src/components/chat/ChatPanel.tsx
+@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'react';
+ import { theme } from '../../theme';
+ import { useT } from '../../i18n/locale';
+ import type { AgentContext } from '../../agent/context';
++import type { ProposalController } from '../../agent/proposalController';
+ import type { MediaAsset, TimelineState } from '../../editor/types';
+ import { kindOf } from '../../media/upload';
+ import { useAgent } from '../../agent/useAgent';
+@@ -37,6 +38,7 @@ interface ChatPanelProps {
+   ctx: AgentContext;
+   /** the current project's id — chat history is persisted per project */
+   projectId: string;
++  proposalController: ProposalController;
+   collapsed: boolean;
+   onToggleCollapse: () => void;
+   /** show a proposal's draft result in the player (null = show committed state) */
+@@ -74,9 +76,9 @@ const GUARD_SKILL_LABELS = {
+   'video-gen': '视频生成',
+ } as const;
+ 
+-export function ChatPanel({ ctx, projectId, collapsed, onToggleCollapse, onPreviewState, seed, creativeMode, onCreativeModeChange, onImportMedia }: ChatPanelProps) {
++export function ChatPanel({ ctx, projectId, proposalController, collapsed, onToggleCollapse, onPreviewState, seed, creativeMode, onCreativeModeChange, onImportMedia }: ChatPanelProps) {
+   const t = useT();
+-  const { messages, running, send, stop, enhance, proposal, applyProposal, rejectProposal, clearHistory, proposalStale, forceApplyProposal, reProposeStale, pendingGuard, liveTool } = useAgent(ctx, projectId);
++  const { messages, running, send, stop, enhance, proposal, applyProposal, rejectProposal, clearHistory, proposalStale, forceApplyProposal, reProposeStale, pendingGuard, liveTool } = useAgent(ctx, projectId, proposalController);
+   const [input, setInput] = useState('');
+   const [mode, setMode] = useState<ChatMode>('agent');
+   const [autoApply, setAutoApply] = useState(false);
+diff --git a/src/components/chat/ProposalCard.tsx b/src/components/chat/ProposalCard.tsx
+index 1b53b12..e863d39 100644
+--- a/src/components/chat/ProposalCard.tsx
++++ b/src/components/chat/ProposalCard.tsx
+@@ -130,11 +130,15 @@ export function ProposalCard({ proposal, onApply, onReject, onPreview, stale, on
+           <button type="button" className="cc-proposal-reject" onClick={reject}>{stale ? t('取消') : t('拒绝')}</button>
+           {stale ? (
+             <>
+-              <button type="button" className="cc-proposal-reject" onClick={() => { onPreview(false); onRePropose?.(); }}>{t('重新提案')}</button>
+-              <button type="button" className="cc-proposal-apply" disabled={noneOn}
+-                onClick={() => { onPreview(false); onForceApply?.(selected); }}>
+-                {t('仍然应用')}
+-              </button>
++              {onRePropose && (
++                <button type="button" className="cc-proposal-reject" onClick={() => { onPreview(false); onRePropose(); }}>{t('重新提案')}</button>
++              )}
++              {onForceApply && (
++                <button type="button" className="cc-proposal-apply" disabled={noneOn}
++                  onClick={() => { onPreview(false); onForceApply(selected); }}>
++                  {t('仍然应用')}
++                </button>
++              )}
+             </>
+           ) : (
+             <button

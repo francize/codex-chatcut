@@ -1,8 +1,9 @@
 // @ts-check
 
 import { execFile } from "node:child_process";
-import { readFile } from "node:fs/promises";
-import { dirname, resolve } from "node:path";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 
@@ -10,10 +11,17 @@ const execFileAsync = promisify(execFile);
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const upstreamRoot = resolve(root, "vendor/openchatcut");
 
+/**
+ * @typedef {{repository: string, revision: string, nodeMajor: number, patches: string[]}}
+ * UpstreamLock
+ */
+
+/** @param {string[]} args @param {{cwd?: string, env?: NodeJS.ProcessEnv}} [options] */
 async function runGit(args, options = {}) {
   try {
     const { stdout } = await execFileAsync("git", args, {
       cwd: options.cwd ?? root,
+      env: options.env,
       encoding: "utf8",
       maxBuffer: 16 * 1024 * 1024,
     });
@@ -26,8 +34,30 @@ async function runGit(args, options = {}) {
   }
 }
 
+/** @param {UpstreamLock} lock */
+async function verifyPatchSeries(lock) {
+  const scratch = await mkdtemp(join(tmpdir(), "codex-chatcut-patch-index-"));
+  const env = { ...process.env, GIT_INDEX_FILE: resolve(scratch, "index") };
+  try {
+    await runGit(["read-tree", lock.revision], { cwd: upstreamRoot, env });
+    for (const patchPath of lock.patches) {
+      if (!patchPath.startsWith("patches/openchatcut/") || !patchPath.endsWith(".patch")) {
+        throw new Error(`Unsafe Host Patch path in UPSTREAM.json: ${patchPath}`);
+      }
+      const absolutePatch = resolve(root, patchPath);
+      await runGit(["apply", "--cached", "--check", absolutePatch], { cwd: upstreamRoot, env });
+      await runGit(["apply", "--cached", absolutePatch], { cwd: upstreamRoot, env });
+    }
+    await runGit(["diff", "--cached", "--check"], { cwd: upstreamRoot, env });
+  } finally {
+    await rm(scratch, { recursive: true, force: true });
+  }
+}
+
 export async function readUpstreamLock() {
-  const lock = JSON.parse(await readFile(resolve(root, "UPSTREAM.json"), "utf8"));
+  const lock = /** @type {UpstreamLock} */ (
+    JSON.parse(await readFile(resolve(root, "UPSTREAM.json"), "utf8"))
+  );
   if (
     typeof lock.repository !== "string" ||
     !/^[0-9a-f]{40}$/.test(lock.revision) ||
@@ -40,6 +70,7 @@ export async function readUpstreamLock() {
   return lock;
 }
 
+/** @param {{expectedRevision?: string}} [options] */
 export async function inspectUpstream(options = {}) {
   const lock = await readUpstreamLock();
   const expectedRevision = options.expectedRevision ?? lock.revision;
@@ -60,12 +91,7 @@ export async function inspectUpstream(options = {}) {
   });
   if (status) throw new Error(`OpenChatCut submodule is dirty:\n${status}`);
 
-  for (const patchPath of lock.patches) {
-    if (!patchPath.startsWith("patches/openchatcut/") || !patchPath.endsWith(".patch")) {
-      throw new Error(`Unsafe Host Patch path in UPSTREAM.json: ${patchPath}`);
-    }
-    await runGit(["apply", "--check", resolve(root, patchPath)], { cwd: upstreamRoot });
-  }
+  await verifyPatchSeries(lock);
 
   return {
     repository: lock.repository,
@@ -74,6 +100,7 @@ export async function inspectUpstream(options = {}) {
     clean: true,
     nodeMajor: lock.nodeMajor,
     patches: [...lock.patches],
+    patchOrderVerified: true,
   };
 }
 

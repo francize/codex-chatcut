@@ -1,0 +1,382 @@
+diff --git a/server/external-agent/security.ts b/server/external-agent/security.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..033e6499c26aa8b5d50e90a76b06f16d1c77f9a0
+--- /dev/null
++++ b/server/external-agent/security.ts
+@@ -0,0 +1,157 @@
++import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
++import type { IncomingMessage, ServerResponse } from 'node:http';
++
++const BROWSER_COOKIE = 'openchatcut_browser_capability';
++const DEFAULT_CAPABILITY_TTL_MS = 15 * 60 * 1_000;
++const MAX_ACTIVE_CAPABILITIES = 16;
++
++export interface AuthorizationSuccess {
++  ok: true;
++}
++
++export interface AuthorizationFailure {
++  ok: false;
++  status: 401 | 403 | 503;
++  error: string;
++}
++
++export type Authorization = AuthorizationSuccess | AuthorizationFailure;
++
++export interface ExternalAgentSecurityOptions {
++  mcpCredential?: string;
++  browserCredential?: string;
++  capabilityTtlMs?: number;
++}
++
++function header(value: string | string[] | undefined): string | null {
++  return typeof value === 'string' ? value : null;
++}
++
++function equalSecret(actual: string | null, expected: string): boolean {
++  if (!actual) return false;
++  const actualBytes = Buffer.from(actual);
++  const expectedBytes = Buffer.from(expected);
++  return actualBytes.length === expectedBytes.length && timingSafeEqual(actualBytes, expectedBytes);
++}
++
++function capabilityDigest(value: string): string {
++  return createHash('sha256').update(value).digest('base64url');
++}
++
++function cookieValue(req: IncomingMessage, name: string): string | null {
++  const cookies = header(req.headers.cookie);
++  if (!cookies) return null;
++  for (const pair of cookies.split(';')) {
++    const separator = pair.indexOf('=');
++    if (separator < 0 || pair.slice(0, separator).trim() !== name) continue;
++    return pair.slice(separator + 1).trim() || null;
++  }
++  return null;
++}
++
++function forbidden(error: string): AuthorizationFailure {
++  return { ok: false, status: 403, error };
++}
++
++export class ExternalAgentSecurity {
++  private readonly mcpCredential: string;
++  private readonly browserCredential: string;
++  private readonly capabilityTtlMs: number;
++  private readonly browserCapabilities = new Map<string, number>();
++
++  constructor(options: ExternalAgentSecurityOptions = {}) {
++    this.mcpCredential = options.mcpCredential?.trim()
++      ?? process.env.OPENCHATCUT_MCP_TOKEN?.trim()
++      ?? '';
++    this.browserCredential = options.browserCredential?.trim()
++      || process.env.OPENCHATCUT_BROWSER_TOKEN?.trim()
++      || randomBytes(32).toString('base64url');
++    if (this.mcpCredential && equalSecret(this.browserCredential, this.mcpCredential)) {
++      throw new Error('OpenChatCut MCP and browser credentials must be different');
++    }
++    this.capabilityTtlMs = Math.max(1_000, options.capabilityTtlMs ?? DEFAULT_CAPABILITY_TTL_MS);
++  }
++
++  loopbackOrigin(req: IncomingMessage): string | null {
++    const { localAddress, localPort } = req.socket;
++    if (localAddress !== '127.0.0.1' || !Number.isInteger(localPort) || !localPort) return null;
++    return `http://127.0.0.1:${localPort}`;
++  }
++
++  private requestBoundary(req: IncomingMessage, browser: boolean): Authorization {
++    const expectedOrigin = this.loopbackOrigin(req);
++    if (!expectedOrigin) return forbidden('OpenChatCut bridge accepts loopback requests only');
++    const expectedHost = new URL(expectedOrigin).host;
++    if (header(req.headers.host) !== expectedHost) {
++      return forbidden('invalid OpenChatCut bridge Host');
++    }
++
++    const origin = header(req.headers.origin);
++    const fetchSite = header(req.headers['sec-fetch-site']);
++    if (browser) {
++      if (origin !== expectedOrigin) return forbidden('invalid OpenChatCut bridge Origin');
++      if (fetchSite !== 'same-origin') return forbidden('invalid OpenChatCut bridge fetch site');
++    } else {
++      if (origin !== null && origin !== expectedOrigin) {
++        return forbidden('invalid OpenChatCut bridge Origin');
++      }
++      if (fetchSite !== null && fetchSite !== 'same-origin') {
++        return forbidden('invalid OpenChatCut bridge fetch site');
++      }
++    }
++    return { ok: true };
++  }
++
++  authorizeMcp(req: IncomingMessage): Authorization {
++    const boundary = this.requestBoundary(req, false);
++    if (!boundary.ok) return boundary;
++    if (!this.mcpCredential) {
++      return { ok: false, status: 503, error: 'OpenChatCut MCP credential is not configured' };
++    }
++    const authorization = header(req.headers.authorization);
++    const supplied = authorization?.startsWith('Bearer ') ? authorization.slice(7) : null;
++    if (!equalSecret(supplied, this.mcpCredential)) {
++      return { ok: false, status: 401, error: 'invalid OpenChatCut MCP credential' };
++    }
++    return { ok: true };
++  }
++
++  authorizeBrowser(req: IncomingMessage): Authorization {
++    const boundary = this.requestBoundary(req, true);
++    if (!boundary.ok) return boundary;
++    this.removeExpiredCapabilities();
++    const capability = cookieValue(req, BROWSER_COOKIE);
++    const expiresAt = capability ? this.browserCapabilities.get(capabilityDigest(capability)) : undefined;
++    if (!expiresAt || expiresAt <= Date.now()) {
++      return { ok: false, status: 401, error: 'invalid OpenChatCut browser capability' };
++    }
++    return { ok: true };
++  }
++
++  issueBrowserCapability(req: IncomingMessage, res: ServerResponse): Authorization {
++    const boundary = this.requestBoundary(req, true);
++    if (!boundary.ok) return boundary;
++    this.removeExpiredCapabilities();
++    while (this.browserCapabilities.size >= MAX_ACTIVE_CAPABILITIES) {
++      const oldest = this.browserCapabilities.keys().next().value as string | undefined;
++      if (!oldest) break;
++      this.browserCapabilities.delete(oldest);
++    }
++
++    const capability = this.browserCredential;
++    this.browserCapabilities.set(capabilityDigest(capability), Date.now() + this.capabilityTtlMs);
++    const maxAge = Math.max(1, Math.floor(this.capabilityTtlMs / 1_000));
++    res.setHeader(
++      'Set-Cookie',
++      `${BROWSER_COOKIE}=${capability}; HttpOnly; SameSite=Strict; Path=/api/external-agent; Max-Age=${maxAge}`,
++    );
++    return { ok: true };
++  }
++
++  private removeExpiredCapabilities(): void {
++    const now = Date.now();
++    for (const [digest, expiresAt] of this.browserCapabilities) {
++      if (expiresAt <= now) this.browserCapabilities.delete(digest);
++    }
++  }
++}
+diff --git a/server/plugins/external-agent.ts b/server/plugins/external-agent.ts
+index d9753c58664cd061063f74870bb7dc9043f675ec..8375c2d32e9e1ef569faab9de8b327f48aa3aa6f 100644
+--- a/server/plugins/external-agent.ts
++++ b/server/plugins/external-agent.ts
+@@ -7,6 +7,11 @@ import {
+   type ExternalToolSchema,
+ } from '../external-agent/broker.ts';
+ import { handleMcpRequest, mcpTools } from '../external-agent/mcp.ts';
++import {
++  ExternalAgentSecurity,
++  type Authorization,
++  type ExternalAgentSecurityOptions,
++} from '../external-agent/security.ts';
+ 
+ const MAX_BODY_BYTES = 2 * 1024 * 1024;
+ 
+@@ -32,9 +37,16 @@ function sendJson(res: ServerResponse, status: number, body: unknown): void {
+   res.statusCode = status;
+   res.setHeader('Content-Type', 'application/json');
+   res.setHeader('Cache-Control', 'no-store');
++  res.setHeader('X-Content-Type-Options', 'nosniff');
+   res.end(JSON.stringify(body));
+ }
+ 
++function sendAuthorizationFailure(res: ServerResponse, authorization: Authorization): boolean {
++  if (authorization.ok) return false;
++  sendJson(res, authorization.status, { error: authorization.error });
++  return true;
++}
++
+ function validTools(value: unknown): value is ExternalToolSchema[] {
+   return Array.isArray(value) && value.every((tool) => (
+     isRecord(tool)
+@@ -44,21 +56,51 @@ function validTools(value: unknown): value is ExternalToolSchema[] {
+   ));
+ }
+ 
+-function authorized(req: IncomingMessage): boolean {
+-  const token = process.env.OPENCHATCUT_MCP_TOKEN?.trim();
+-  return !token || req.headers.authorization === `Bearer ${token}`;
+-}
+-
+-function requestBaseUrl(req: IncomingMessage): string {
++function requestBaseUrl(req: IncomingMessage, security: ExternalAgentSecurity): string {
++  const origin = security.loopbackOrigin(req);
++  if (!origin) throw new Error('OpenChatCut editor origin is not loopback');
+   const configured = process.env.OPENCHATCUT_EDITOR_URL?.trim();
+-  if (configured) return configured;
+-  const proto = String(req.headers['x-forwarded-proto'] ?? 'http').split(',')[0].trim();
+-  const host = String(req.headers['x-forwarded-host'] ?? req.headers.host ?? '127.0.0.1:5199').split(',')[0].trim();
+-  return `${proto}://${host}`;
++  if (configured) {
++    const invalidOrigin = 'OPENCHATCUT_EDITOR_URL must match the exact loopback sidecar origin';
++    let url: URL;
++    try {
++      url = new URL(configured);
++    } catch {
++      throw new Error(invalidOrigin);
++    }
++    if (
++      url.protocol !== 'http:'
++      || url.hostname !== '127.0.0.1'
++      || url.origin !== origin
++      || url.pathname !== '/'
++      || url.username
++      || url.password
++      || url.search
++      || url.hash
++    ) {
++      throw new Error(invalidOrigin);
++    }
++  }
++  return origin;
+ }
+ 
+-async function handleBridge(req: IncomingMessage, res: ServerResponse): Promise<void> {
++async function handleBridge(
++  req: IncomingMessage,
++  res: ServerResponse,
++  security: ExternalAgentSecurity,
++): Promise<void> {
+   const url = new URL(req.url ?? '/', 'http://localhost');
++  if (req.method === 'POST' && url.pathname === '/bootstrap') {
++    if (sendAuthorizationFailure(res, security.issueBrowserCapability(req, res))) return;
++    sendJson(res, 200, { ok: true });
++    return;
++  }
++
++  const authorization = url.pathname === '/tools'
++    ? security.authorizeMcp(req)
++    : security.authorizeBrowser(req);
++  if (sendAuthorizationFailure(res, authorization)) return;
++
+   if (req.method === 'POST' && url.pathname === '/register') {
+     const body = await readJson(req);
+     if (typeof body.projectId !== 'string' || typeof body.editorId !== 'string' || !validTools(body.tools)) {
+@@ -68,12 +110,19 @@ async function handleBridge(req: IncomingMessage, res: ServerResponse): Promise<
+     sendJson(res, 200, { ok: true });
+     return;
+   }
+-  if (req.method === 'GET' && url.pathname === '/poll') {
+-    const projectId = url.searchParams.get('projectId') ?? '';
+-    const editorId = url.searchParams.get('editorId') ?? '';
++  if ((req.method === 'GET' || req.method === 'POST') && url.pathname === '/poll') {
++    const body = req.method === 'POST' ? await readJson(req) : null;
++    const projectId = req.method === 'POST'
++      ? (typeof body?.projectId === 'string' ? body.projectId : '')
++      : (url.searchParams.get('projectId') ?? '');
++    const editorId = req.method === 'POST'
++      ? (typeof body?.editorId === 'string' ? body.editorId : '')
++      : (url.searchParams.get('editorId') ?? '');
++    if (!projectId || !editorId) throw new Error('invalid editor poll');
+     const call = await nextEditorCall(projectId, editorId, AbortSignal.timeout(26_000));
+     if (!call) {
+       res.statusCode = 204;
++      res.setHeader('Cache-Control', 'no-store');
+       res.end();
+     } else sendJson(res, 200, call);
+     return;
+@@ -84,10 +133,6 @@ async function handleBridge(req: IncomingMessage, res: ServerResponse): Promise<
+     sendJson(res, settleEditorCall(body.id, body.ok, body.value) ? 200 : 404, { ok: true });
+     return;
+   }
+-  if (!authorized(req)) {
+-    sendJson(res, 401, { error: 'invalid OpenChatCut MCP token' });
+-    return;
+-  }
+   if (req.method === 'GET' && url.pathname === '/tools') {
+     sendJson(res, 200, { tools: mcpTools() });
+     return;
+@@ -95,21 +140,21 @@ async function handleBridge(req: IncomingMessage, res: ServerResponse): Promise<
+   sendJson(res, 404, { error: 'not found' });
+ }
+ 
+-export function externalAgentPlugin(): Plugin {
++export function externalAgentPlugin(options: ExternalAgentSecurityOptions = {}): Plugin {
++  const security = new ExternalAgentSecurity(options);
+   return {
+     name: 'openchatcut-external-agent',
+     configureServer(server) {
+       server.middlewares.use('/api/external-agent', (req, res) => {
+-        void handleBridge(req, res).catch((error) => {
++        void handleBridge(req, res, security).catch((error) => {
+           if (!res.headersSent) sendJson(res, 400, { error: error instanceof Error ? error.message : String(error) });
+         });
+       });
+       server.middlewares.use('/api/external-mcp/mcp', (req, res) => {
+-        if (!authorized(req)) {
+-          sendJson(res, 401, { error: 'invalid OpenChatCut MCP token' });
+-          return;
+-        }
+-        void handleMcpRequest(req, res, requestBaseUrl(req)).catch((error) => {
++        if (sendAuthorizationFailure(res, security.authorizeMcp(req))) return;
++        void (async () => {
++          await handleMcpRequest(req, res, requestBaseUrl(req, security));
++        })().catch((error) => {
+           server.config.logger.error(`[external-mcp] ${error instanceof Error ? error.message : String(error)}`);
+           if (!res.headersSent) sendJson(res, 500, { error: 'MCP request failed' });
+         });
+diff --git a/src/agent/useExternalAgentBridge.ts b/src/agent/useExternalAgentBridge.ts
+index ef5d72630e9e762d2b0a81c67c5c91b87db6af00..506e5c85e4c64f441ac11e8a412e2d2f421dd353 100644
+--- a/src/agent/useExternalAgentBridge.ts
++++ b/src/agent/useExternalAgentBridge.ts
+@@ -12,12 +12,25 @@ interface ExternalCall {
+ const nextPaint = () => new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+ const retryDelay = () => new Promise<void>((resolve) => setTimeout(resolve, 1_000));
+ 
++async function bootstrapBrowserCapability(signal: AbortSignal): Promise<void> {
++  const response = await fetch('/api/external-agent/bootstrap', {
++    method: 'POST',
++    credentials: 'same-origin',
++    headers: { 'Content-Type': 'application/json' },
++    body: '{}',
++    signal,
++  });
++  if (!response.ok) throw new Error(`bridge bootstrap failed: HTTP ${response.status}`);
++}
++
+ async function sendResult(id: string, ok: boolean, value: unknown): Promise<void> {
+-  await fetch('/api/external-agent/result', {
++  const response = await fetch('/api/external-agent/result', {
+     method: 'POST',
++    credentials: 'same-origin',
+     headers: { 'Content-Type': 'application/json' },
+     body: JSON.stringify({ id, ok, value }),
+   });
++  if (!response.ok) throw new Error(`result delivery failed: HTTP ${response.status}`);
+ }
+ 
+ async function executeExternalCall(
+@@ -48,18 +61,24 @@ export function useExternalAgentBridge(ctx: AgentContext, projectId: string): vo
+     const run = async () => {
+       while (!controller.signal.aborted) {
+         try {
++          await bootstrapBrowserCapability(controller.signal);
+           const registered = await fetch('/api/external-agent/register', {
+             method: 'POST',
++            credentials: 'same-origin',
+             headers: { 'Content-Type': 'application/json' },
+             body: JSON.stringify({ projectId, editorId, tools: TOOL_SCHEMAS }),
+             signal: controller.signal,
+           });
+           if (!registered.ok) throw new Error(`registration failed: HTTP ${registered.status}`);
+           while (!controller.signal.aborted) {
+-            const response = await fetch(
+-              `/api/external-agent/poll?projectId=${encodeURIComponent(projectId)}&editorId=${encodeURIComponent(editorId)}`,
+-              { signal: controller.signal },
+-            );
++            await bootstrapBrowserCapability(controller.signal);
++            const response = await fetch('/api/external-agent/poll', {
++              method: 'POST',
++              credentials: 'same-origin',
++              headers: { 'Content-Type': 'application/json' },
++              body: JSON.stringify({ projectId, editorId }),
++              signal: controller.signal,
++            });
+             if (response.status === 204) continue;
+             if (!response.ok) throw new Error(`poll failed: HTTP ${response.status}`);
+             await executeExternalCall(await response.json() as ExternalCall, ctxRef.current, projectId);

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Open ChatCut"
+  short_description: "Open the real OpenChatCut editor inside Codex"
+  default_prompt: "Use $open-chatcut to open the video editor for this workspace."

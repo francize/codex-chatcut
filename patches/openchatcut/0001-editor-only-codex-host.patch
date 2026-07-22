@@ -1,0 +1,254 @@
+diff --git a/src/App.tsx b/src/App.tsx
+index d520731d0d86311f3507934bbb20d07457eed0b3..b436a23746383564dea465e306a5b56a7b4cf0cc 100644
+--- a/src/App.tsx
++++ b/src/App.tsx
+@@ -57,6 +57,7 @@ function EditorLoader({ meta, onHome, onRename }: { meta: ProjectMeta; onHome: (
+ 
+ export default function App() {
+   const t = useT();
++  const isCodexHost = new URLSearchParams(window.location.search).get('host') === 'codex';
+   const [projects, setProjects] = useState<ProjectMeta[] | null>(null);
+   const [route, setRoute] = useState<Route>(parseHash());
+ 
+@@ -70,6 +71,7 @@ export default function App() {
+   // build-time __CONFIGURED_CAPS__ snapshot after any key edited in a prior session).
+   // keys (booleans only) refine the manifest to vendor granularity.
+   useEffect(() => {
++    if (isCodexHost) return;
+     fetch('/api/keys')
+       .then((r) => r.json() as Promise<{ caps?: Record<string, boolean>; keys?: Record<string, { configured: boolean }>; models?: Record<string, string> }>)
+       .then((d) => {
+@@ -81,7 +83,7 @@ export default function App() {
+         }
+       })
+       .catch(() => { /* dev endpoint absent (e.g. preview build) — keep the define snapshot */ });
+-  }, []);
++  }, [isCodexHost]);
+ 
+   const refresh = useCallback(async () => { setProjects(await listProjects()); }, []);
+ 
+diff --git a/src/Editor.tsx b/src/Editor.tsx
+index e91c6b3d8aabc548f440bef82d2a1ba28d866abc..bb6147b38c8f39a6c0e604a6b5a26cdb17114858 100644
+--- a/src/Editor.tsx
++++ b/src/Editor.tsx
+@@ -1,9 +1,8 @@
+-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
++import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from 'react';
+ import type { PlayerRef } from '@remotion/player';
+ import { theme } from './theme';
+ import { ExportDialog } from './export/ExportDialog';
+ import { TopBar } from './components/TopBar';
+-import { ChatPanel } from './components/chat/ChatPanel';
+ import { LibraryPanel } from './library/LibraryPanel';
+ import { PreviewPanel } from './components/PreviewPanel';
+ import { InspectorPanel } from './components/InspectorPanel';
+@@ -39,6 +38,8 @@ import { useExternalAgentBridge } from './agent/useExternalAgentBridge';
+ import { isolateVoiceOnSrc, strengthFromAudioFxId } from './audio/isolateVoice';
+ import { analyzeClipLoudness, gainForTarget } from './audio/loudness';
+ 
++const ChatPanel = lazy(() => import('./components/chat/ChatPanel').then((module) => ({ default: module.ChatPanel })));
++
+ interface EditorProps {
+   initial: ProjectDoc;
+   project: ProjectMeta;
+@@ -57,6 +58,7 @@ const BASELINE_CONTENT_H = 761;
+ 
+ export default function Editor({ initial, project, onHome, onRename }: EditorProps) {
+   const t = useT();
++  const isCodexHost = new URLSearchParams(window.location.search).get('host') === 'codex';
+   const { state, doc, commands, canUndo, canRedo } = useEditor(initial);
+   const selectedItem = state.items.find((it) => it.id === state.selectedId) ?? null;
+   const trackOptions = useMemo(
+@@ -321,20 +323,22 @@ export default function Editor({ initial, project, onHome, onRename }: EditorPro
+     openDesign: () => setShowDesign(true),
+     openHistory: () => setShowVersions(true),
+     openShortcuts: () => setShowShortcuts(true),
+-    toggleLayout: () => setChatCollapsed((value) => !value),
+-    focusAgent: () => {
+-      setChatCollapsed(false);
+-      requestAnimationFrame(() => {
+-        document.querySelector<HTMLTextAreaElement>('[data-cc-chat-composer]')?.focus();
+-      });
+-    },
++    ...(!isCodexHost ? {
++      toggleLayout: () => setChatCollapsed((value) => !value),
++      focusAgent: () => {
++        setChatCollapsed(false);
++        requestAnimationFrame(() => {
++          document.querySelector<HTMLTextAreaElement>('[data-cc-chat-composer]')?.focus();
++        });
++      },
++    } : {}),
+   });
+ 
+   return (
+     <div
+       style={{
+         display: 'grid',
+-        gridTemplateColumns: `${chatCollapsed ? 46 : chatW}px 0 ${libW}px 0 minmax(0, 1fr)`,
++        gridTemplateColumns: `${isCodexHost ? 0 : chatCollapsed ? 46 : chatW}px 0 ${libW}px 0 minmax(0, 1fr)`,
+         gridTemplateRows: `${HEADER_H}px minmax(0, 1fr) 0 ${timelineH}px`,
+         height: '100vh',
+         overflow: 'hidden',
+@@ -345,11 +349,11 @@ export default function Editor({ initial, project, onHome, onRename }: EditorPro
+     >
+       <TopBar
+         projectName={project.name}
+-
+         canUndo={canUndo}
+         canRedo={canRedo}
+         onHome={onHome}
+         onRename={onRename}
++        showLayoutToggle={!isCodexHost}
+       />
+       {exportOpen && (
+         <ExportDialog state={state} projectName={project.name} onClose={() => setExportOpen(false)} />
+@@ -367,17 +371,21 @@ export default function Editor({ initial, project, onHome, onRename }: EditorPro
+ 
+       {showShortcuts && <ShortcutsDialog onClose={() => setShowShortcuts(false)} />}
+ 
+-      <ChatPanel ctx={agentCtx} projectId={project.id} collapsed={chatCollapsed} onToggleCollapse={() => setChatCollapsed((v) => !v)} onPreviewState={setPreviewState} seed={chatSeed} creativeMode={creativeMode} onCreativeModeChange={changeCreativeMode} onImportMedia={importToPool} />
++      {!isCodexHost && (
++        <Suspense fallback={null}>
++          <ChatPanel ctx={agentCtx} projectId={project.id} collapsed={chatCollapsed} onToggleCollapse={() => setChatCollapsed((v) => !v)} onPreviewState={setPreviewState} seed={chatSeed} creativeMode={creativeMode} onCreativeModeChange={changeCreativeMode} onImportMedia={importToPool} />
++        </Suspense>
++      )}
+ 
+       <div style={{ gridColumn: 2, gridRow: '2 / 5' }}>
+-        {!chatCollapsed && <Divider onResize={(dx) => setChatW((w) => clamp(w + dx, CHAT_MIN_W, Math.max(CHAT_MIN_W, viewportW - libW - CANVAS_MIN_W - SPLITTER_TOTAL_W)))} />}
++        {!isCodexHost && !chatCollapsed && <Divider onResize={(dx) => setChatW((w) => clamp(w + dx, CHAT_MIN_W, Math.max(CHAT_MIN_W, viewportW - libW - CANVAS_MIN_W - SPLITTER_TOTAL_W)))} />}
+       </div>
+ 
+       <div style={{ gridColumn: 3, gridRow: 2, minHeight: 0, minWidth: 0, overflow: 'hidden' }}>
+         <LibraryPanel templates={allTemplates} transitions={state.transitions ?? []} fxDefs={state.fxDefs ?? {}} onAddTemplate={addTemplate} onAddAudio={(a) => commands.addAudio(a)} playerRef={playerRef} fps={state.fps} items={state.items} trackOptions={trackOptions} captions={state.captions ?? null} onSetCaptions={commands.setCaptions} onUpdateCaptions={commands.updateCaptions} onSetItemTranscript={commands.setItemTranscript} onToggleWord={commands.toggleWord} onCleanScript={commands.cleanScript} onSetGapCap={commands.setGapCap} onSetTranscriptPlayOrder={commands.setTranscriptPlayOrder} onReorderTrackItems={commands.reorderTrackItems} onClearEdits={commands.clearEdits} assets={state.assets ?? []} mediaFolders={doc.mediaFolders} onImportMedia={importToPool} onAddMediaItem={(asset) => commands.addMediaItem(asset)} onCreateMediaFolder={commands.createMediaFolder} onRenameMediaFolder={commands.renameMediaFolder} onDeleteMediaFolder={commands.deleteMediaFolder} onMoveMediaAssets={commands.moveMediaAssets} onRenameMediaAsset={commands.renameMediaAsset} onSetMediaAssetFavorite={commands.setMediaAssetFavorite} onRemoveMediaAsset={commands.removeMediaAsset}
+           onRelinkMediaAsset={(id, next) => commands.relinkMediaAsset(id, next)}
+           onAddSolid={() => commands.addSolidItem({ startFrame: getPlayhead() })}
+-          onUseTemplateAI={useTemplateAI}
++          onUseTemplateAI={isCodexHost ? undefined : useTemplateAI}
+           selectedItem={selectedItem}
+           onApplyTransition={(type, custom) => state.selectedId && commands.addTransition(state.selectedId, type, undefined, custom)}
+           onApplyFx={(assetId) => {
+@@ -412,12 +420,12 @@ export default function Editor({ initial, project, onHome, onRename }: EditorPro
+  />
+       </div>
+       <div style={{ gridColumn: 4, gridRow: 2 }}>
+-        <Divider onResize={(dx) => setLibW((w) => clamp(w + dx, ASSETS_MIN_W, Math.max(ASSETS_MIN_W, viewportW - (chatCollapsed ? 46 : chatW) - CANVAS_MIN_W - SPLITTER_TOTAL_W)))} />
++        <Divider onResize={(dx) => setLibW((w) => clamp(w + dx, ASSETS_MIN_W, Math.max(ASSETS_MIN_W, viewportW - (isCodexHost ? 0 : chatCollapsed ? 46 : chatW) - CANVAS_MIN_W - SPLITTER_TOTAL_W)))} />
+       </div>
+       <div style={{ gridColumn: 5, gridRow: 2, display: 'flex', flexDirection: 'column', minHeight: 0, minWidth: 0, overflow: 'hidden' }}>
+         <PreviewPanel state={previewState ?? state} playerRef={playerRef} onImport={importToCanvas}
+           onUpdateCaptions={previewState ? undefined : commands.updateCaptions}
+-          onSeedChat={(text) => setChatSeed({ text, nonce: Date.now() })} />
++          onSeedChat={isCodexHost ? undefined : (text) => setChatSeed({ text, nonce: Date.now() })} />
+         {selectedItem && (
+           <InspectorPanel
+             templates={allTemplates}
+diff --git a/src/components/TopBar.tsx b/src/components/TopBar.tsx
+index 440d7a9f358d080d91a6c98a6e82574d5d9e88ca..49b3affc65eb0fc8bb347aff964a07e01ac0cc81 100644
+--- a/src/components/TopBar.tsx
++++ b/src/components/TopBar.tsx
+@@ -31,6 +31,7 @@ interface TopBarProps {
+   exporting?: boolean;
+   onHome?: () => void;
+   onRename?: (name: string) => void;
++  showLayoutToggle?: boolean;
+ }
+ 
+ // one right-side icon button (monochrome lucide, hover-lit)
+@@ -45,7 +46,7 @@ function TBtn({ icon, title, onClick, disabled }: { icon: IconName; title: strin
+   );
+ }
+ 
+-export function TopBar({ projectName, canUndo, canRedo, exporting, onHome, onRename }: TopBarProps) {
++export function TopBar({ projectName, canUndo, canRedo, exporting, onHome, onRename, showLayoutToggle = true }: TopBarProps) {
+   const t = useT();
+   const [editing, setEditing] = useState(false);
+   const [draft, setDraft] = useState(projectName);
+@@ -85,7 +86,9 @@ export function TopBar({ projectName, canUndo, canRedo, exporting, onHome, onRen
+       {/* self-contained: trigger + popover, global export history, zero props */}
+       <ExportHistory />
+       <LocaleToggle />
+-      <TBtn icon="layoutPanel" title={t('切换面板布局')} onClick={() => invokeAction('toggle-layout', undefined, 'toolbar')} />
++      {showLayoutToggle && (
++        <TBtn icon="layoutPanel" title={t('切换面板布局')} onClick={() => invokeAction('toggle-layout', undefined, 'toolbar')} />
++      )}
+       <button onClick={() => invokeAction('open-export', undefined, 'toolbar')} disabled={exporting} title={t('导出 MP4')}
+         style={{ width: 58, height: 26, background: theme.accent, color: theme.onAccent, border: 'none', borderRadius: 2, padding: 0, fontSize: 12, fontWeight: 600, cursor: exporting ? 'default' : 'pointer', opacity: exporting ? 0.6 : 1, marginLeft: 4 }}>
+         {exporting ? t('导出中…') : t('导出')}
+diff --git a/src/library/LibraryPanel.tsx b/src/library/LibraryPanel.tsx
+index 2d077bfc55854516e53e728fa413d97b93eea321..e4309b50b913255ecd03eecea5df8cc80b808e99 100644
+--- a/src/library/LibraryPanel.tsx
++++ b/src/library/LibraryPanel.tsx
+@@ -110,7 +110,7 @@ interface LibraryPanelProps {
+   onRelinkMediaAsset?: (id: string, next: { src: string; name?: string; durationInFrames?: number; width?: number; height?: number; kind?: MediaAsset['kind'] }) => void;
+   onAddSolid?: () => void;
+   /** ⋮ menu「用 AI 生成」: seed the chat with this template as a reference */
+-  onUseTemplateAI: (tpl: Tpl) => void;
++  onUseTemplateAI?: (tpl: Tpl) => void;
+   /** 扩展中心「创作」的数据源 */
+   transitions: TransitionItem[];
+   fxDefs: Record<string, SerializableFxDef>;
+diff --git a/src/library/TemplateBrowser.tsx b/src/library/TemplateBrowser.tsx
+index c0e9590787885b0754a34510f2c53b95a41f35d7..0bec34c20b5564ea0f3c108ef591965ca7a5cd92 100644
+--- a/src/library/TemplateBrowser.tsx
++++ b/src/library/TemplateBrowser.tsx
+@@ -46,7 +46,7 @@ const MENU_H = 148;
+ interface TemplateBrowserProps {
+   templates: Tpl[];
+   onAdd: (tpl: Tpl) => void;
+-  onUseAI: (tpl: Tpl) => void;
++  onUseAI?: (tpl: Tpl) => void;
+ }
+ 
+ export const TemplateBrowser = memo(function TemplateBrowser({ templates, onAdd, onUseAI }: TemplateBrowserProps) {
+@@ -282,14 +282,16 @@ export const TemplateBrowser = memo(function TemplateBrowser({ templates, onAdd,
+               onMouseEnter={(e) => { e.currentTarget.style.background = 'var(--cc-hover)'; }}
+               onMouseLeave={(e) => { e.currentTarget.style.background = 'none'; }}
+             >≡ {t('添加到时间线')}</button>
+-            <button
+-              type="button"
+-              role="menuitem"
+-              onClick={() => { onUseAI(menuTpl); closeMenu(); }}
+-              style={{ ...menuItem, display: 'inline-flex', alignItems: 'center', gap: 6 }}
+-              onMouseEnter={(e) => { e.currentTarget.style.background = 'var(--cc-hover)'; }}
+-              onMouseLeave={(e) => { e.currentTarget.style.background = 'none'; }}
+-            ><Icon name="sparkles" size={13} />{t('用 AI 生成')}</button>
++            {onUseAI && (
++              <button
++                type="button"
++                role="menuitem"
++                onClick={() => { onUseAI(menuTpl); closeMenu(); }}
++                style={{ ...menuItem, display: 'inline-flex', alignItems: 'center', gap: 6 }}
++                onMouseEnter={(e) => { e.currentTarget.style.background = 'var(--cc-hover)'; }}
++                onMouseLeave={(e) => { e.currentTarget.style.background = 'none'; }}
++              ><Icon name="sparkles" size={13} />{t('用 AI 生成')}</button>
++            )}
+             <div style={{ height: 0.5, background: theme.border, margin: '4px 6px' }} />
+             {confirmDelete ? (
+               <div style={{ display: 'flex', gap: 4, padding: '2px 4px 4px' }}>
+diff --git a/src/shortcuts/useEditorActions.ts b/src/shortcuts/useEditorActions.ts
+index dce02b5e25cbf14608f596f7bc201fae00824c36..140a66196fe6cfa7a31b2068cb95f3a405ebb07e 100644
+--- a/src/shortcuts/useEditorActions.ts
++++ b/src/shortcuts/useEditorActions.ts
+@@ -17,8 +17,8 @@ interface EditorActionDeps {
+   openDesign: () => void;
+   openHistory: () => void;
+   openShortcuts: () => void;
+-  toggleLayout: () => void;
+-  focusAgent: () => void;
++  toggleLayout?: () => void;
++  focusAgent?: () => void;
+ }
+ 
+ const timeline = (ref: RefObject<TimelineShortcutApi | null>) => ref.current;
+@@ -100,8 +100,8 @@ function viewActions(deps: EditorActionDeps): ActionBindings {
+     'open-export': () => deps.openExport(),
+     'open-design': () => deps.openDesign(),
+     'open-history': () => deps.openHistory(),
+-    'toggle-layout': () => deps.toggleLayout(),
+-    'ask-ai': () => deps.focusAgent(),
++    ...(deps.toggleLayout ? { 'toggle-layout': () => deps.toggleLayout?.() } : {}),
++    ...(deps.focusAgent ? { 'ask-ai': () => deps.focusAgent?.() } : {}),
+   };
+ }
+ 

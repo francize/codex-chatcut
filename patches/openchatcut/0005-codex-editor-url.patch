@@ -1,0 +1,45 @@
+diff --git a/server/external-agent/editor-url.ts b/server/external-agent/editor-url.ts
+new file mode 100644
+index 0000000..11e8b76
+--- /dev/null
++++ b/server/external-agent/editor-url.ts
+@@ -0,0 +1,15 @@
++/** Build the editor link returned by the external MCP control tools. */
++export function externalEditorUrl(
++  args: Record<string, unknown>,
++  projectId: string,
++  fallbackBase: string,
++  hostMode = process.env.OPENCHATCUT_HOST_MODE?.trim(),
++): string {
++  const codexHost = hostMode === 'codex';
++  const requestedBase = String(args.editorBaseUrl ?? '').trim();
++  // In Codex Host Mode the authenticated sidecar origin is authoritative. Do
++  // not let an MCP argument turn the Browser handoff into an external URL.
++  const base = (codexHost ? fallbackBase : requestedBase || fallbackBase).replace(/\/+$/, '');
++  const hostQuery = codexHost ? '?host=codex' : '';
++  return `${base}/${hostQuery}#/editor/${encodeURIComponent(projectId)}`;
++}
+diff --git a/server/external-agent/mcp.ts b/server/external-agent/mcp.ts
+index a20d32e..60b1702 100644
+--- a/server/external-agent/mcp.ts
++++ b/server/external-agent/mcp.ts
+@@ -15,6 +15,7 @@ import {
+   setTargetProject,
+ } from './broker.ts';
+ import { createExternalProject, listExternalProjects } from './projects.ts';
++import { externalEditorUrl as editorUrl } from './editor-url.ts';
+ 
+ const PROJECT_SELECTOR = {
+   type: 'string',
+@@ -74,11 +75,6 @@ const CONTROL_TOOLS: Tool[] = [
+   },
+ ];
+ 
+-function editorUrl(args: Record<string, unknown>, projectId: string, fallbackBase: string): string {
+-  const base = String(args.editorBaseUrl ?? '').trim() || fallbackBase;
+-  return `${base.replace(/\/+$/, '')}/#/editor/${encodeURIComponent(projectId)}`;
+-}
+-
+ export function mcpTools(): Tool[] {
+   const controls = new Set(CONTROL_TOOLS.map((tool) => tool.name));
+   const editorTools = registeredTools()

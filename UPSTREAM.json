@@ -2,5 +2,13 @@
   "repository": "https://github.com/0xsline/OpenChatCut.git",
   "revision": "850c238b894c2b0138ffc7944e8c7e2c30156fcd",
   "nodeMajor": 24,
-  "patches": []
+  "patches": [
+    "patches/openchatcut/0001-editor-only-codex-host.patch",
+    "patches/openchatcut/0002-windowless-sidecar.patch",
+    "patches/openchatcut/0003-secure-external-bridge.patch",
+    "patches/openchatcut/0004-reuse-native-proposals.patch",
+    "patches/openchatcut/0005-codex-editor-url.patch",
+    "patches/openchatcut/0006-cancellable-external-calls.patch",
+    "patches/openchatcut/0007-secure-entire-embedded-surface.patch"
+  ]
 }

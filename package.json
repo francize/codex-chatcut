@@ -1,27 +1,27 @@
 {
   "name": "codex-chatcut",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "license": "AGPL-3.0-or-later",
   "type": "module",
   "engines": {
-    "node": ">=22"
+    "node": ">=24 <25"
   },
   "scripts": {
-    "build": "node scripts/build-widget.mjs",
+    "build": "node scripts/build.mjs",
+    "stage:plugin": "node scripts/stage-local-plugin.mjs",
+    "validate:plugin": "node scripts/stage-local-plugin.mjs --check",
     "typecheck": "tsc --noEmit",
     "test": "node --test tests/*.test.mjs",
     "probe:mcp": "node scripts/probe-mcp.mjs",
     "verify:upstream": "node scripts/verify-upstream.mjs",
-    "quality": "npm run typecheck && npm test && npm run build && npm run probe:mcp"
+    "quality": "npm run typecheck && npm test && npm run build && npm run probe:mcp && npm run verify:upstream"
   },
   "dependencies": {
-    "@modelcontextprotocol/ext-apps": "^1.7.4",
-    "@modelcontextprotocol/sdk": "^1.29.0",
-    "zod": "^4.4.3"
+    "@modelcontextprotocol/sdk": "^1.29.0"
   },
   "devDependencies": {
-    "@types/node": "^26.1.1",
+    "@types/node": "^24.0.0",
     "esbuild": "^0.25.0",
     "typescript": "^5.9.0"
   }

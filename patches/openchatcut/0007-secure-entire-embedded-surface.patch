@@ -1,0 +1,564 @@
+diff --git a/desktop/embedded-server.ts b/desktop/embedded-server.ts
+index 34955c4..7fd38fe 100644
+--- a/desktop/embedded-server.ts
++++ b/desktop/embedded-server.ts
+@@ -9,12 +9,36 @@ import { createServer, type Server } from 'node:http';
+ import { resolve } from 'node:path';
+ import type { ViteDevServer } from 'vite';
+ import { serverPlugins } from '../server/plugins/index.ts';
++import {
++  embeddedBrowserSecurityMiddleware,
++  ExternalAgentSecurity,
++} from '../server/external-agent/security.ts';
+ import { getKey, seedKeystore } from '../server/keystore.ts';
+ import { proxyMiddleware } from '../server/proxy.ts';
+ import { parseEnvText } from './env-file.ts';
+ import { createMiniConnect } from './mini-connect.ts';
+ import { distStaticMiddleware, uploadsMiddleware } from './static-files.ts';
+ 
++const DYNAMIC_PREFIXES = [
++  '/api',
++  '/upload',
++  '/export',
++  '/render',
++  '/generate',
++  '/llm',
++  '/assemblyai',
++  '/e2b',
++  '/media/uploads',
++];
++
++function dynamicPath(path: string): boolean {
++  return DYNAMIC_PREFIXES.some((prefix) => (
++    path === prefix
++    || path.startsWith(`${prefix}/`)
++    || path.startsWith(`${prefix}-`)
++  ));
++}
++
+ export interface EmbeddedServer {
+   server: Server;
+   port: number;
+@@ -37,6 +61,24 @@ export async function startEmbeddedServer(distDir: string): Promise<EmbeddedServ
+   const app = createMiniConnect((err) => {
+     console.error('[embedded-server]', err instanceof Error ? err.message : err);
+   });
++  const externalAgentSecurity = new ExternalAgentSecurity();
++  const codexHost = process.env.OPENCHATCUT_HOST_MODE === 'codex';
++
++  // This must be the first route. It protects key-injecting proxies as well as
++  // every plugin, media route and static subresource behind the browser
++  // capability issued to a real top-level editor navigation.
++  if (codexHost) app.use(embeddedBrowserSecurityMiddleware(externalAgentSecurity));
++
++  // General server-side URL fetching is outside the Codex Host Mode boundary.
++  // Users can still add local media through the existing upload surface.
++  if (codexHost) {
++    app.use('/api/import-url', (_req, res) => {
++      res.statusCode = 403;
++      res.setHeader('Content-Type', 'application/json');
++      res.setHeader('Cache-Control', 'no-store');
++      res.end(JSON.stringify({ error: 'Remote URL import is disabled in Codex Host Mode' }));
++    });
++  }
+ 
+   // 代理在前(路径不与插件冲突,靠前少走几次匹配)
+   app.use('/assemblyai', proxyMiddleware({
+@@ -55,7 +97,7 @@ export async function startEmbeddedServer(distDir: string): Promise<EmbeddedServ
+       },
+     },
+   } as unknown as ViteDevServer;
+-  for (const plugin of serverPlugins()) {
++  for (const plugin of serverPlugins({ externalAgentSecurity })) {
+     const hook = plugin.configureServer;
+     const fn = typeof hook === 'function' ? hook : hook?.handler;
+     await fn?.call(plugin as never, fake);
+@@ -63,6 +105,18 @@ export async function startEmbeddedServer(distDir: string): Promise<EmbeddedServ
+ 
+   // 静态兜底在最后:运行时上传素材优先于 dist 的 build 期拷贝
+   app.use('/media/uploads', uploadsMiddleware());
++  // A valid capability must not turn an unknown dynamic path into index.html.
++  // All real handlers ran above; anything left in a dynamic namespace is 404.
++  if (codexHost) {
++    app.use((req, res, next) => {
++      const path = new URL(req.url ?? '/', 'http://localhost').pathname;
++      if (!dynamicPath(path)) { next(); return; }
++      res.statusCode = 404;
++      res.setHeader('Content-Type', 'application/json');
++      res.setHeader('Cache-Control', 'no-store');
++      res.end(JSON.stringify({ error: 'not found' }));
++    });
++  }
+   app.use(distStaticMiddleware(distDir));
+ 
+   const server = createServer((req, res) => app.handle(req, res));
+diff --git a/server/external-agent/security.ts b/server/external-agent/security.ts
+index 033e649..5fb2190 100644
+--- a/server/external-agent/security.ts
++++ b/server/external-agent/security.ts
+@@ -23,6 +23,12 @@ export interface ExternalAgentSecurityOptions {
+   capabilityTtlMs?: number;
+ }
+ 
++export type EmbeddedSecurityMiddleware = (
++  req: IncomingMessage,
++  res: ServerResponse,
++  next: () => void,
++) => void;
++
+ function header(value: string | string[] | undefined): string | null {
+   return typeof value === 'string' ? value : null;
+ }
+@@ -78,14 +84,20 @@ export class ExternalAgentSecurity {
+     return `http://127.0.0.1:${localPort}`;
+   }
+ 
+-  private requestBoundary(req: IncomingMessage, browser: boolean): Authorization {
++  authorizeLoopbackHost(req: IncomingMessage): Authorization {
+     const expectedOrigin = this.loopbackOrigin(req);
+-    if (!expectedOrigin) return forbidden('OpenChatCut bridge accepts loopback requests only');
++    if (!expectedOrigin) return forbidden('OpenChatCut accepts loopback requests only');
+     const expectedHost = new URL(expectedOrigin).host;
+     if (header(req.headers.host) !== expectedHost) {
+-      return forbidden('invalid OpenChatCut bridge Host');
++      return forbidden('invalid OpenChatCut Host');
+     }
++    return { ok: true };
++  }
+ 
++  private requestBoundary(req: IncomingMessage, browser: boolean): Authorization {
++    const loopback = this.authorizeLoopbackHost(req);
++    if (!loopback.ok) return loopback;
++    const expectedOrigin = this.loopbackOrigin(req)!;
+     const origin = header(req.headers.origin);
+     const fetchSite = header(req.headers['sec-fetch-site']);
+     if (browser) {
+@@ -102,6 +114,16 @@ export class ExternalAgentSecurity {
+     return { ok: true };
+   }
+ 
++  private validBrowserCapability(req: IncomingMessage): Authorization {
++    this.removeExpiredCapabilities();
++    const capability = cookieValue(req, `${BROWSER_COOKIE}_${req.socket.localPort ?? 'invalid'}`);
++    const expiresAt = capability ? this.browserCapabilities.get(capabilityDigest(capability)) : undefined;
++    if (!expiresAt || expiresAt <= Date.now()) {
++      return { ok: false, status: 401, error: 'invalid OpenChatCut browser capability' };
++    }
++    return { ok: true };
++  }
++
+   authorizeMcp(req: IncomingMessage): Authorization {
+     const boundary = this.requestBoundary(req, false);
+     if (!boundary.ok) return boundary;
+@@ -119,18 +141,52 @@ export class ExternalAgentSecurity {
+   authorizeBrowser(req: IncomingMessage): Authorization {
+     const boundary = this.requestBoundary(req, true);
+     if (!boundary.ok) return boundary;
+-    this.removeExpiredCapabilities();
+-    const capability = cookieValue(req, BROWSER_COOKIE);
+-    const expiresAt = capability ? this.browserCapabilities.get(capabilityDigest(capability)) : undefined;
+-    if (!expiresAt || expiresAt <= Date.now()) {
+-      return { ok: false, status: 401, error: 'invalid OpenChatCut browser capability' };
++    return this.validBrowserCapability(req);
++  }
++
++  /** Same-origin reads and media elements commonly omit Origin. */
++  authorizeBrowserRead(req: IncomingMessage): Authorization {
++    const boundary = this.authorizeLoopbackHost(req);
++    if (!boundary.ok) return boundary;
++    const expectedOrigin = this.loopbackOrigin(req)!;
++    const origin = header(req.headers.origin);
++    if (origin !== null && origin !== expectedOrigin) {
++      return forbidden('invalid OpenChatCut Origin');
+     }
+-    return { ok: true };
++    const fetchSite = header(req.headers['sec-fetch-site']);
++    if (fetchSite !== 'same-origin' && fetchSite !== 'none') {
++      return forbidden('invalid OpenChatCut fetch site');
++    }
++    return this.validBrowserCapability(req);
+   }
+ 
+   issueBrowserCapability(req: IncomingMessage, res: ServerResponse): Authorization {
+     const boundary = this.requestBoundary(req, true);
+     if (!boundary.ok) return boundary;
++    this.setBrowserCapability(req, res);
++    return { ok: true };
++  }
++
++  issueNavigationCapability(req: IncomingMessage, res: ServerResponse): Authorization {
++    const boundary = this.authorizeLoopbackHost(req);
++    if (!boundary.ok) return boundary;
++    const expectedOrigin = this.loopbackOrigin(req)!;
++    const origin = header(req.headers.origin);
++    const fetchSite = header(req.headers['sec-fetch-site']);
++    if (
++      req.method !== 'GET'
++      || (origin !== null && origin !== expectedOrigin)
++      || (fetchSite !== 'none' && fetchSite !== 'same-origin')
++      || header(req.headers['sec-fetch-mode']) !== 'navigate'
++      || header(req.headers['sec-fetch-dest']) !== 'document'
++    ) {
++      return forbidden('invalid OpenChatCut editor navigation');
++    }
++    this.setBrowserCapability(req, res);
++    return { ok: true };
++  }
++
++  private setBrowserCapability(req: IncomingMessage, res: ServerResponse): void {
+     this.removeExpiredCapabilities();
+     while (this.browserCapabilities.size >= MAX_ACTIVE_CAPABILITIES) {
+       const oldest = this.browserCapabilities.keys().next().value as string | undefined;
+@@ -143,9 +199,8 @@ export class ExternalAgentSecurity {
+     const maxAge = Math.max(1, Math.floor(this.capabilityTtlMs / 1_000));
+     res.setHeader(
+       'Set-Cookie',
+-      `${BROWSER_COOKIE}=${capability}; HttpOnly; SameSite=Strict; Path=/api/external-agent; Max-Age=${maxAge}`,
++      `${BROWSER_COOKIE}_${req.socket.localPort}=${capability}; HttpOnly; SameSite=Strict; Path=/; Max-Age=${maxAge}`,
+     );
+-    return { ok: true };
+   }
+ 
+   private removeExpiredCapabilities(): void {
+@@ -155,3 +210,71 @@ export class ExternalAgentSecurity {
+     }
+   }
+ }
++
++function sendAuthorizationFailure(
++  res: ServerResponse,
++  authorization: Authorization,
++): boolean {
++  if (authorization.ok) return false;
++  res.statusCode = authorization.status;
++  res.setHeader('Content-Type', 'application/json');
++  res.setHeader('Cache-Control', 'no-store');
++  res.setHeader('X-Content-Type-Options', 'nosniff');
++  res.end(JSON.stringify({ error: authorization.error }));
++  return true;
++}
++
++/**
++ * Protect every embedded-server route before key-injecting proxies or upstream
++ * plugins run. MCP bearer routes and control-only tool discovery retain their
++ * narrower authorization handlers. The credential-free editor document is the
++ * only route that may create an initial HttpOnly browser capability; bootstrap
++ * can renew it only after this middleware validates the existing cookie.
++ */
++export function embeddedBrowserSecurityMiddleware(
++  security: ExternalAgentSecurity,
++): EmbeddedSecurityMiddleware {
++  return (req, res, next) => {
++    res.setHeader('Cross-Origin-Opener-Policy', 'same-origin');
++    res.setHeader('Content-Security-Policy', "frame-ancestors 'none'");
++    res.setHeader('Referrer-Policy', 'no-referrer');
++    res.setHeader('X-Content-Type-Options', 'nosniff');
++    res.setHeader('X-Frame-Options', 'DENY');
++
++    const loopback = security.authorizeLoopbackHost(req);
++    if (sendAuthorizationFailure(res, loopback)) return;
++
++    const requestUrl = new URL(req.url ?? '/', 'http://localhost');
++    const path = requestUrl.pathname;
++    if (
++      path === '/api/external-mcp/mcp'
++      || path === '/api/external-agent/tools'
++    ) {
++      next();
++      return;
++    }
++    if (path === '/' || path === '/index.html') {
++      const navigation = security.issueNavigationCapability(req, res);
++      if (!navigation.ok) {
++        const existing = security.authorizeBrowserRead(req);
++        if (sendAuthorizationFailure(res, existing)) return;
++      }
++      if (requestUrl.searchParams.get('host') !== 'codex') {
++        requestUrl.searchParams.set('host', 'codex');
++        res.statusCode = 307;
++        res.setHeader('Location', `${path}${requestUrl.search}`);
++        res.setHeader('Cache-Control', 'no-store');
++        res.end();
++        return;
++      }
++      next();
++      return;
++    }
++
++    const authorization = req.method === 'GET' || req.method === 'HEAD'
++      ? security.authorizeBrowserRead(req)
++      : security.authorizeBrowser(req);
++    if (sendAuthorizationFailure(res, authorization)) return;
++    next();
++  };
++}
+diff --git a/server/llm-proxy.verify.ts b/server/llm-proxy.verify.ts
+index 1534867..c1a91b0 100644
+--- a/server/llm-proxy.verify.ts
++++ b/server/llm-proxy.verify.ts
+@@ -56,7 +56,15 @@ const explicit = expandLlmProviderPatch(new Map([
+ assert.equal(explicit.get('LLM_MODEL'), 'gpt-custom');
+ assert.equal(explicit.get('LLM_BASE_URL'), 'https://relay.test/v2');
+ 
+-const seen: Array<{ url: string; authorization?: string; provider?: string; body: string }> = [];
++const seen: Array<{
++  url: string;
++  authorization?: string;
++  provider?: string;
++  cookie?: string;
++  origin?: string;
++  referer?: string;
++  body: string;
++}> = [];
+ const upstream = createServer(async (req, res) => {
+   const chunks: Buffer[] = [];
+   for await (const chunk of req) chunks.push(Buffer.from(chunk));
+@@ -66,9 +74,17 @@ const upstream = createServer(async (req, res) => {
+     provider: typeof req.headers['x-openchatcut-provider'] === 'string'
+       ? req.headers['x-openchatcut-provider']
+       : undefined,
++    cookie: typeof req.headers.cookie === 'string' ? req.headers.cookie : undefined,
++    origin: typeof req.headers.origin === 'string' ? req.headers.origin : undefined,
++    referer: typeof req.headers.referer === 'string' ? req.headers.referer : undefined,
+     body: Buffer.concat(chunks).toString('utf8'),
+   });
+-  res.writeHead(200, { 'content-type': 'text/plain' });
++  res.writeHead(200, {
++    'content-type': 'text/plain',
++    'set-cookie': 'openchatcut_browser_capability=attacker; Path=/',
++    'set-cookie2': 'openchatcut_browser_capability=attacker2; Path=/',
++    'clear-site-data': '"cookies"',
++  });
+   res.end('{"ok":true}');
+ });
+ const upstreamPort = await listen(upstream);
+@@ -86,11 +102,21 @@ const proxyPort = await listen(proxy);
+ try {
+   const first = await fetch(`http://127.0.0.1:${proxyPort}/llm/chat/completions?stream=true`, {
+     method: 'POST',
+-    headers: { 'content-type': 'application/json', 'x-openchatcut-provider': 'kimi' },
++    headers: {
++      authorization: 'Bearer client-secret',
++      cookie: 'openchatcut_browser_capability=browser-secret',
++      origin: `http://127.0.0.1:${proxyPort}`,
++      referer: `http://127.0.0.1:${proxyPort}/?host=codex`,
++      'content-type': 'application/json',
++      'x-openchatcut-provider': 'kimi',
++    },
+     body: '{"model":"compatible"}',
+   });
+   assert.equal(first.status, 200);
+   assert.equal(first.headers.get('content-type'), 'application/json');
++  assert.equal(first.headers.get('set-cookie'), null);
++  assert.equal(first.headers.get('set-cookie2'), null);
++  assert.equal(first.headers.get('clear-site-data'), null);
+   assert.deepEqual(await first.json(), { ok: true });
+ 
+   target = `http://127.0.0.1:${upstreamPort}/v1`;
+@@ -104,12 +130,18 @@ try {
+       url: '/v1beta/openai/chat/completions?api-version=preview&stream=true',
+       authorization: 'Bearer server-secret',
+       provider: undefined,
++      cookie: undefined,
++      origin: undefined,
++      referer: undefined,
+       body: '{"model":"compatible"}',
+     },
+     {
+       url: '/v1/responses',
+       authorization: 'Bearer server-secret',
+       provider: undefined,
++      cookie: undefined,
++      origin: undefined,
++      referer: undefined,
+       body: '{"model":"openai"}',
+     },
+   ]);
+diff --git a/server/media-dir.ts b/server/media-dir.ts
+index a425877..71b710c 100644
+--- a/server/media-dir.ts
++++ b/server/media-dir.ts
+@@ -18,6 +18,7 @@ export const DEFAULT_UPLOAD_DIR = join(process.cwd(), 'public', 'media', 'upload
+ export function isSafeUploadName(name: string): boolean {
+   if (!name || name.startsWith('.')) return false;
+   if (name.includes('/') || name.includes('\\') || name.includes('\0')) return false;
++  if (process.env.OPENCHATCUT_HOST_MODE === 'codex' && /\.svg$/i.test(name)) return false;
+   return true;
+ }
+ 
+@@ -32,6 +33,7 @@ export function expandMediaDir(raw: string): string | null {
+ 
+ /** 当前素材保存目录:MEDIA_DIR 未设或非法时回默认 public/media/uploads。 */
+ export function uploadDir(): string {
++  if (process.env.OPENCHATCUT_HOST_MODE === 'codex') return DEFAULT_UPLOAD_DIR;
+   return expandMediaDir(getKey('MEDIA_DIR')) ?? DEFAULT_UPLOAD_DIR;
+ }
+ 
+@@ -91,6 +93,7 @@ export async function serveDiskFile(req: IncomingMessage, res: ServerResponse, f
+     'Content-Type': mimeFor(file),
+     'Accept-Ranges': 'bytes',
+     'Content-Length': String(end - start + 1),
++    'X-Content-Type-Options': 'nosniff',
+   };
+   if (status === 206) headers['Content-Range'] = `bytes ${start}-${end}/${info.size}`;
+   res.writeHead(status, headers);
+@@ -156,6 +159,9 @@ export async function mediaDirProbe(get: (name: KeyName) => string): Promise<Res
+ 
+ export async function checkMediaDir(raw: string): Promise<DirProbeBody> {
+   if (!raw.trim()) return { ok: true, note: `未设置 · 使用默认目录 ${DEFAULT_UPLOAD_DIR}` };
++  if (process.env.OPENCHATCUT_HOST_MODE === 'codex') {
++    return { ok: false, error: 'Codex Host Mode 固定使用 workspace 内素材目录' };
++  }
+   const dir = expandMediaDir(raw);
+   if (!dir) return { ok: false, error: '必须是绝对路径（可用 ~/ 开头）' };
+   try {
+diff --git a/server/plugins/external-agent.ts b/server/plugins/external-agent.ts
+index ab12c7a..07190c0 100644
+--- a/server/plugins/external-agent.ts
++++ b/server/plugins/external-agent.ts
+@@ -14,6 +14,10 @@ import {
+   type ExternalAgentSecurityOptions,
+ } from '../external-agent/security.ts';
+ 
++export interface ExternalAgentPluginOptions extends ExternalAgentSecurityOptions {
++  security?: ExternalAgentSecurity;
++}
++
+ const MAX_BODY_BYTES = 2 * 1024 * 1024;
+ 
+ function isRecord(value: unknown): value is Record<string, unknown> {
+@@ -148,8 +152,8 @@ async function handleBridge(
+   sendJson(res, 404, { error: 'not found' });
+ }
+ 
+-export function externalAgentPlugin(options: ExternalAgentSecurityOptions = {}): Plugin {
+-  const security = new ExternalAgentSecurity(options);
++export function externalAgentPlugin(options: ExternalAgentPluginOptions = {}): Plugin {
++  const security = options.security ?? new ExternalAgentSecurity(options);
+   return {
+     name: 'openchatcut-external-agent',
+     configureServer(server) {
+diff --git a/server/plugins/index.ts b/server/plugins/index.ts
+index 5185b28..86b16b0 100644
+--- a/server/plugins/index.ts
++++ b/server/plugins/index.ts
+@@ -26,11 +26,16 @@ import { stockSearchPlugin } from './stock.ts';
+ import { firecrawlPlugin } from './firecrawl.ts';
+ import { settingsPlugin } from './settings.ts';
+ import { externalAgentPlugin } from './external-agent.ts';
++import type { ExternalAgentSecurity } from '../external-agent/security.ts';
+ import { llmProxyPlugin } from './llm-proxy.ts';
+ import { getKey } from '../keystore.ts';
+ 
+-export function serverPlugins(): Plugin[] {
+-  return [llmProxyPlugin(), projectStorePlugin(), extensionStorePlugin(), externalAgentPlugin(), settingsPlugin(), exportPlugin(), uploadMultipartPlugin(), uploadPlugin(), extractAudioPlugin(), extractFramesPlugin(), mediaPreviewPlugin(), isolateVoicePlugin(), normalizeMediaPlugin(), imageGenerationPlugin({
++export interface ServerPluginOptions {
++  externalAgentSecurity?: ExternalAgentSecurity;
++}
++
++export function serverPlugins(options: ServerPluginOptions = {}): Plugin[] {
++  return [llmProxyPlugin(), projectStorePlugin(), extensionStorePlugin(), externalAgentPlugin({ security: options.externalAgentSecurity }), settingsPlugin(), exportPlugin(), uploadMultipartPlugin(), uploadPlugin(), extractAudioPlugin(), extractFramesPlugin(), mediaPreviewPlugin(), isolateVoicePlugin(), normalizeMediaPlugin(), imageGenerationPlugin({
+     get baseUrl() { return getKey('IMAGE_BASE_URL') || 'https://api.openai.com'; },
+     get apiKey() { return getKey('IMAGE_API_KEY') || getKey('OPENAI_API_KEY'); },
+     get geminiBaseUrl() { return getKey('GEMINI_BASE_URL') || 'https://generativelanguage.googleapis.com'; },
+diff --git a/server/plugins/upload-multipart.ts b/server/plugins/upload-multipart.ts
+index 0e0bc0e..900061b 100644
+--- a/server/plugins/upload-multipart.ts
++++ b/server/plugins/upload-multipart.ts
+@@ -217,6 +217,10 @@ export function uploadMultipartPlugin(): Plugin {
+           }
+           const assetIdRaw = String(body.assetId ?? '').replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 80);
+           const ext = (extname(name).toLowerCase().replace(/[^.a-z0-9]/g, '') || '.bin');
++          if (process.env.OPENCHATCUT_HOST_MODE === 'codex' && ext === '.svg') {
++            sendError(res, 415, 'SVG uploads are disabled in Codex Host Mode');
++            return;
++          }
+           const uploadId = randomUUID().replace(/-/g, '');
+           const meta: MultipartMeta = {
+             uploadId,
+diff --git a/server/plugins/upload.ts b/server/plugins/upload.ts
+index 119a1d2..13a92ef 100644
+--- a/server/plugins/upload.ts
++++ b/server/plugins/upload.ts
+@@ -154,6 +154,12 @@ function extFromUrlOrType(url: string, contentType: string | null, nameHint?: st
+   return '.bin';
+ }
+ 
++function rejectActiveCodexUpload(ext: string): void {
++  if (process.env.OPENCHATCUT_HOST_MODE === 'codex' && ext.toLowerCase() === '.svg') {
++    throw new Error('SVG uploads are disabled in Codex Host Mode');
++  }
++}
++
+ /**
+  * Dev-server plugin:
+  * - POST /upload?name=…  raw body → uploadDir()（默认 public/media/uploads）
+@@ -353,6 +359,7 @@ export function uploadPlugin(): Plugin {
+           const nameRaw = String(body.name ?? 'file');
+           const assetIdRaw = String(body.assetId ?? '').replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 80);
+           const ext = (extname(nameRaw).toLowerCase().replace(/[^.a-z0-9]/g, '') || '.bin');
++          rejectActiveCodexUpload(ext);
+           const base = assetIdRaw || randomUUID();
+           const fname = isSafeUploadName(`${base}${ext}`) ? `${base}${ext}` : `${randomUUID()}${ext}`;
+           const contentType = typeof body.contentType === 'string' && body.contentType
+@@ -423,6 +430,7 @@ export function uploadPlugin(): Plugin {
+           const assetIdRaw = url.searchParams.get('assetId') ?? '';
+           const assetId = assetIdRaw.replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 80);
+           const ext = (extname(name).toLowerCase().replace(/[^.a-z0-9]/g, '') || '.bin');
++          rejectActiveCodexUpload(ext);
+ 
+           const declared = contentLengthOf(req);
+           if (declared != null && declared > maxBytes) {
+@@ -513,6 +521,7 @@ export function uploadPlugin(): Plugin {
+           }
+ 
+           const ext = extFromUrlOrType(remote, contentType, nameHint);
++          rejectActiveCodexUpload(ext);
+           const dir = uploadDir();
+           await mkdir(dir, { recursive: true });
+           const fname = `${randomUUID()}${ext}`;
+diff --git a/server/proxy.ts b/server/proxy.ts
+index 85378c7..da75956 100644
+--- a/server/proxy.ts
++++ b/server/proxy.ts
+@@ -7,6 +7,18 @@ import { request as httpsRequest } from 'node:https';
+ type Middleware = (req: IncomingMessage, res: ServerResponse, next: () => void) => unknown;
+ 
+ const HOP_BY_HOP = new Set(['host', 'connection', 'keep-alive', 'proxy-authorization', 'proxy-connection', 'transfer-encoding', 'upgrade', 'te', 'trailer']);
++const PRIVATE_CLIENT_HEADERS = new Set([
++  'authorization',
++  'cookie',
++  'origin',
++  'referer',
++  'sec-fetch-dest',
++  'sec-fetch-mode',
++  'sec-fetch-site',
++  'sec-fetch-user',
++  'x-openchatcut-provider',
++]);
++const PRIVATE_UPSTREAM_HEADERS = new Set(['clear-site-data', 'set-cookie', 'set-cookie2']);
+ 
+ export interface ProxyRoute {
+   /** Target API prefix, evaluated per request. */
+@@ -32,7 +44,8 @@ export function proxyMiddleware(route: ProxyRoute): Middleware {
+     }
+     const headers: Record<string, string | string[]> = {};
+     for (const [k, v] of Object.entries(req.headers)) {
+-      if (!HOP_BY_HOP.has(k.toLowerCase()) && k.toLowerCase() !== 'x-openchatcut-provider' && v !== undefined) {
++      const name = k.toLowerCase();
++      if (!HOP_BY_HOP.has(name) && !PRIVATE_CLIENT_HEADERS.has(name) && v !== undefined) {
+         headers[k] = v;
+       }
+     }
+@@ -60,7 +73,10 @@ export function proxyMiddleware(route: ProxyRoute): Middleware {
+     }, (upRes) => {
+       const outHeaders: Record<string, string | string[]> = {};
+       for (const [k, v] of Object.entries(upRes.headers)) {
+-        if (!HOP_BY_HOP.has(k.toLowerCase()) && v !== undefined) outHeaders[k] = v;
++        const name = k.toLowerCase();
++        if (!HOP_BY_HOP.has(name) && !PRIVATE_UPSTREAM_HEADERS.has(name) && v !== undefined) {
++          outHeaders[k] = v;
++        }
+       }
+       if (route.forceJsonContentType) {
+         const ct = String(outHeaders['content-type'] ?? '');

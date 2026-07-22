@@ -1,6 +1,6 @@
 {
   "name": "codex-chatcut",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Run the real OpenChatCut editor inside Codex with no second chat.",
   "author": {
     "name": "francize",

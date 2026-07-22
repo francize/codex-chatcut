@@ -1,0 +1,96 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  source-mvp:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Check out source and pinned upstream
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Use Node.js 24
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Install adapter dependencies
+        run: npm ci
+
+      - name: Verify upstream pin and patches
+        run: npm run verify:upstream
+
+      - name: Prepare and build patched OpenChatCut
+        id: prepare
+        shell: bash
+        run: |
+          report="$RUNNER_TEMP/prepared-openchatcut.json"
+          node scripts/prepare-openchatcut.mjs --build | tee "$report"
+          echo "root=$(jq -r .target "$report")" >> "$GITHUB_OUTPUT"
+
+      - name: Test patched OpenChatCut
+        run: npm --prefix "${{ steps.prepare.outputs.root }}" test
+
+      - name: Lint patched OpenChatCut
+        run: npm --prefix "${{ steps.prepare.outputs.root }}" run lint
+
+      - name: Stage the real local plugin bundle
+        run: npm run stage:plugin
+
+      - name: Validate the staged bundle against source
+        run: npm run validate:plugin
+
+      - name: Typecheck adapter
+        run: npm run typecheck
+
+      - name: Test adapter
+        run: npm test
+        env:
+          CODEX_CHATCUT_REAL_UPSTREAM: "1"
+          CODEX_CHATCUT_PREPARED_ROOT: ${{ steps.prepare.outputs.root }}
+
+      - name: Build source plugin
+        run: npm run build
+
+      - name: Probe stdio MCP
+        run: npm run probe:mcp
+
+      - name: Re-verify upstream after tests
+        run: npm run verify:upstream
+
+      - name: Check committed patch formatting
+        shell: bash
+        env:
+          EVENT_NAME: "${{ github.event_name }}"
+          BASE_REF: "${{ github.base_ref }}"
+          BEFORE_SHA: "${{ github.event.before }}"
+        run: |
+          if [[ "$EVENT_NAME" == "pull_request" ]]; then
+            base="$(git merge-base "origin/$BASE_REF" HEAD)"
+          elif [[ "$EVENT_NAME" == "push" && "$BEFORE_SHA" =~ ^[0-9a-f]{40}$ && "$BEFORE_SHA" != "0000000000000000000000000000000000000000" ]]; then
+            base="$BEFORE_SHA"
+          elif git rev-parse HEAD^ >/dev/null 2>&1; then
+            base="$(git rev-parse HEAD^)"
+          else
+            git show --check --format= HEAD
+            exit 0
+          fi
+          git diff --check "$base..HEAD"
+
+      - name: Ensure validation did not modify tracked source
+        shell: bash
+        run: test -z "$(git status --porcelain --untracked-files=no)"

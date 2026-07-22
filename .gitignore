@@ -4,3 +4,5 @@ coverage/
 *.log
 .scratch/
 .runtime/
+.codex-chatcut/
+.local-plugin/

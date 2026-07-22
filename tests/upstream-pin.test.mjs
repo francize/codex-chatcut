@@ -15,6 +15,7 @@ test("the OpenChatCut dependency is pinned, clean, licensed, and patchable", asy
   assert.equal(report.clean, true);
   assert.equal(report.remote, lock.repository);
   assert.deepEqual(report.patches, lock.patches);
+  assert.equal(report.patchOrderVerified, true);
 
   const packageJson = JSON.parse(await readFile(new URL("../package.json", import.meta.url), "utf8"));
   const pluginJson = JSON.parse(
